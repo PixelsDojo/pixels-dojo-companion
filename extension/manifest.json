@@ -1,0 +1,44 @@
+{
+  "manifest_version": 3,
+  "name": "Pixels Dojo Companion",
+  "short_name": "Pixels Dojo",
+  "version": "1.0.0",
+  "description": "Your AI companion for Pixels Online — get instant answers, strategy advice, and live updates from Pixin, Royagi, or Nyanko, right in the game.",
+  "author": "Pixels Dojo",
+  "icons": {
+    "16":  "assets/icon-16.png",
+    "48":  "assets/icon-48.png",
+    "128": "assets/icon-128.png"
+  },
+  "permissions": ["storage"],
+  "content_scripts": [
+    {
+      "matches": ["*://*.pixels.xyz/*"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": [
+        "injected.js",
+        "assets/pixin-idle.png",
+        "assets/nyanko-idle.png",
+        "assets/royagi-idle.png",
+        "assets/torii-icon.png",
+        "assets/pixin-transition-left.png",
+        "assets/pixin-transition-right.png",
+        "assets/pixin-walk-left.png",
+        "assets/pixin-walk-right.png",
+        "assets/nyanko-transition-left.png",
+        "assets/nyanko-transition-right.png",
+        "assets/nyanko-walk-left.png",
+        "assets/nyanko-walk-right.png",
+        "assets/royagi-transition.png",
+        "assets/royagi-walk-left.png",
+        "assets/royagi-walk-right.png"
+      ],
+      "matches": ["*://*.pixels.xyz/*"]
+    }
+  ]
+}

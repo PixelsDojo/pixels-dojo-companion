@@ -1,0 +1,14 @@
+[
+  {
+    "id": "hearth_hall",
+    "title": "Hearth Hall",
+    "keywords": ["hearth hall", "hearthall", "wildgroves", "seedwrights", "reapers", "faction", "offering", "sabotage", "reactor", "yieldstone"],
+    "content": "Pick a faction (union): Wildgroves, Seedwrights or Reapers. Your enemies are the other two.\n\nDuring a season, put offerings into your faction's Hearth. You can also sabotage the enemy unions. The union with the most offerings wins.\n\nGet offerings by: crafting offerings and sabotages; buying Power Offerings in the Hearth Hall shop; Taskboard orders that reward yieldstone boxes (ready to use).\n\nCrafting offerings: buy a reactor recipe in the Hearth Hall shop — single use, it must be re-bought for every craft. Craft the reactor at its station, then convert it in a Yieldstone Press on an NFT land. A press on YOUR faction's land makes an offering for your Hearth; a press on an ENEMY faction's land makes a sabotage. Check a land's faction by clicking its gate. Higher press level → higher offering level (1–5).\n\nEach reactor needs a rare drop you can't produce on purpose — you get it by chance while gathering at higher levels (Pearly Swirl, Mirage Egg, Sunbloom, Ashnut, Gloomshard).\n\nHint: save up offerings for 1 or 2 seasons and then put them in together — your Pixel rewards will be better."
+  },
+  {
+    "id": "animal_care",
+    "title": "Animal Care",
+    "keywords": ["animal care", "coop", "apiary", "sluggery", "hatch", "hatching", "incubator", "baby animal", "gathering basket", "potion table", "composter"],
+    "content": "Animal Care is the skill for all animal products. Item levels and recipes come from the catalog.\n\nBuildings: Coop (chickens → eggs), Apiary (bees → honey, beeswax, royal jelly), Sluggery (silk slugs). Cows, sheep, goats, pigs, ducks, turkeys and dragons are separate animals you place on your land.\n\nCertain animals only become available to harvest from once you reach a certain Animal Care level.\n\nAnimal food is made at the Composter. Some components are made at the Textile Mill and the Metalworking station.\n\nTo collect from animals you need a Gathering Basket, bought at the Pet Store.\n\nSometimes animals drop EGGS (yes, even non-birds). Hatch them in an Incubator (from the Pet Store). Hatching needs 5 potions over 4–5 days, crafted at a Potion Table (an entry-level one is in the Pet Store). The potion's base ingredient changes weekly — click the NPC for the hint.\n\nA hatched egg gives a BABY animal. Babies produce rare resources you can't get from adult animals. They don't become adult animals — they grow up and leave after a certain number of feedings.\n\nYou can't keep an adult animal on a speck, but you CAN hatch and keep a baby animal there — a bonus for non-NFT holders, giving them easy access to animal products."
+  }
+]

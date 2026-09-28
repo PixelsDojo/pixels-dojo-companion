@@ -1,0 +1,26 @@
+{
+  "_version": 1,
+  "_note": "Proven coin earners — bought constantly because recipes use them. Add items as Lizzy verifies them. Items here jump to the front of the market collector queue and are re-checked every 2 h.",
+  "items": [
+    "itm_woodplank_01",
+    "itm_woodplank_02",
+    "itm_woodplank_03",
+    "itm_woodplank_04",
+    "itm_woodplank_05",
+    "itm_metalbar_01",
+    "itm_metalbar_02",
+    "itm_metalbar_03",
+    "itm_metalbar_04",
+    "itm_metalbar_05",
+    "itm_glass01",
+    "itm_glass_05",
+    "itm_glass_bottle",
+    "itm_glassbottle_02",
+    "itm_glassbottle_03",
+    "itm_glassbottle_04",
+    "itm_glassbottle_05",
+    "itm_constructionPowder",
+    "itm_flour",
+    "itm_grainbow_grainshine"
+  ]
+}
