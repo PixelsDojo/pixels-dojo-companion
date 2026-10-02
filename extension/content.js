@@ -47,8 +47,13 @@
   // ---------------------------------------------------------------------------
   const STORAGE_ROOT = 'pixelsCompanion';
 
+  function _extContextOk() {
+    try { return !!chrome.runtime?.id; } catch (_) { return false; }
+  }
+
   /** Resolves with the entire pixelsCompanion root object (never null). */
   function storageGetAll() {
+    if (!_extContextOk()) return Promise.resolve({});
     return new Promise(resolve =>
       chrome.storage.local.get(STORAGE_ROOT, result =>
         resolve(result[STORAGE_ROOT] ?? {})));
@@ -62,6 +67,7 @@
   /** Writes one top-level key inside the root, leaving other keys untouched. */
   function storageSetKey(key, value) {
     return storageGetAll().then(root => {
+      if (!_extContextOk()) return;
       root[key] = value;
       return new Promise((resolve, reject) =>
         chrome.storage.local.set({ [STORAGE_ROOT]: root }, () =>
@@ -160,12 +166,13 @@
   // the local storage write.
   function reportToBackend(snapshot) {
     if (!BACKEND_URL || !snapshot?.landId) return;
+    console.log(TAG, '[land-report] sending', snapshot.landId, 'soilTiers=' + JSON.stringify(snapshot.soilTiers || {}));
     fetch(`${BACKEND_URL}/api/land-report`, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify(snapshot),
     }).then(r => {
-      if (!r.ok) console.warn(TAG, `land-report: server ${r.status}`);
+      console.log(TAG, '[land-report] server', r.status);
     }).catch(err => {
       console.warn(TAG, 'land-report: fetch failed', err);
     });
@@ -219,6 +226,7 @@
         // playerContext — in-memory only; companion UI reads companion.latestPlayerContext
         case 'playerContext':
           companion.latestPlayerContext = data;
+          companion.onPlayerContext(data);
           return; // skip post-write readback log
         // companionEvent — forward notable game events to the companion panel
         case 'companionEvent':
@@ -231,10 +239,12 @@
         // requestPanelCache — injected.js asks for saved taskboard/stacked/chest snapshots
         case 'requestPanelCache': {
           const pid = data?.playerId ?? 'unknown';
-          const [taskboard, stacked, allStorage] = await Promise.all([
+          const [taskboard, stacked, allStorage, activityTimers, plotSeeds] = await Promise.all([
             storageGetKey(`panelCacheTaskboard_${pid}`),
             storageGetKey(`panelCacheStacked_${pid}`),
             storageGetAll(),
+            storageGetKey(`activityTimers_${pid}`),
+            storageGetKey('plotSeeds'),
           ]);
           const chestCaches = {};
           for (const [key, val] of Object.entries(allStorage)) {
@@ -245,7 +255,13 @@
           window.postMessage({
             source:   'pixels-companion-host',
             category: 'panelCache',
-            data:     { taskboard: taskboard ?? null, stacked: stacked ?? null, chestCaches },
+            data:     {
+              taskboard:      taskboard      ?? null,
+              stacked:        stacked        ?? null,
+              chestCaches,
+              activityTimers: activityTimers ?? [],
+              plotSeeds:      plotSeeds      ?? {},
+            },
           }, '*');
           return;
         }
@@ -270,6 +286,28 @@
           if (data?.stacked !== undefined)
             writes.push(storageSetKey(`panelCacheStacked_${pid}`, data.stacked));
           await Promise.all(writes);
+          return;
+        }
+        // activityTimers — injected.js persists the full timer list
+        case 'activityTimers': {
+          const pid = companion.latestPlayerContext?.playerId ?? 'unknown';
+          await storageSetKey(`activityTimers_${pid}`, data.timers ?? []);
+          console.log('[timers] content: saved ' + (data.timers ?? []).length + ' timers for pid=' + pid);
+          window.dispatchEvent(new CustomEvent('px-timers-updated'));
+          return;
+        }
+        // activityTimerCollected — remove one timer from persisted list
+        case 'activityTimerCollected': {
+          const pid2 = companion.latestPlayerContext?.playerId ?? 'unknown';
+          const key  = `activityTimers_${pid2}`;
+          const prev = (await storageGetKey(key)) ?? [];
+          const next = prev.filter((t) => t.entityMid !== data.entityMid);
+          await storageSetKey(key, next);
+          return;
+        }
+        // plotSeeds — map of "mapId:mid" → seedItemId for crop timer labels
+        case 'plotSeeds': {
+          await storageSetKey('plotSeeds', data.seeds ?? {});
           return;
         }
         default:
@@ -828,9 +866,53 @@
           border: 1.5px solid #ccc;
           border-radius: 8px;
           padding: 8px 10px;
+          display: flex;
+          flex-direction: column;
+          gap: 4px;
         }
-        .px-nb-diary-date { font-size: 8px; color: rgba(98,42,255,0.8); margin-bottom: 4px; }
+        .px-nb-diary-date { font-size: 8px; color: rgba(98,42,255,0.8); margin-bottom: 2px; }
         .px-nb-diary-text { font-size: 8px; line-height: 1.7; color: #333; white-space: pre-line; }
+        .px-nb-diary-rows { display: flex; flex-direction: column; gap: 3px; }
+        .px-nb-diary-row  { display: flex; align-items: center; gap: 4px; font-size: 7px; line-height: 1.4; }
+        .px-nb-diary-icon { width: 12px; height: 12px; object-fit: contain; image-rendering: pixelated; flex-shrink: 0; }
+        .px-nb-diary-gain { color: #1a7a1a; font-weight: bold; }
+        .px-nb-diary-loss { color: #c0392b; font-weight: bold; }
+        .px-nb-diary-label { color: #333; }
+        .px-nb-diary-skill { color: #555; font-style: italic; }
+        /* Today's XP section */
+        .px-xp-card {
+          background: #f0f7ff;
+          border: 1.5px solid #b0c8e8;
+          border-radius: 8px;
+          padding: 8px 10px;
+          margin-bottom: 8px;
+          display: flex;
+          flex-direction: column;
+          gap: 4px;
+        }
+        .px-xp-header {
+          display: flex; align-items: center; justify-content: space-between;
+          font-size: 9px; color: rgba(30,90,180,0.9);
+          border-bottom: 1.5px solid rgba(30,90,180,0.25);
+          padding-bottom: 4px; margin-bottom: 2px;
+        }
+        .px-xp-toggle {
+          font-size: 7px; color: rgba(98,42,255,0.8); cursor: pointer;
+          background: none; border: none; padding: 0; font-family: inherit;
+          text-decoration: underline dotted;
+        }
+        .px-xp-row {
+          display: flex; align-items: center; gap: 4px;
+          font-size: 7px; line-height: 1.4;
+        }
+        .px-xp-skill { color: #333; flex: 1; }
+        .px-xp-gain  { color: #1a7a1a; font-weight: bold; margin-left: auto; }
+        .px-xp-lvlup { color: rgba(98,42,255,0.85); font-size: 7px; }
+        .px-xp-total {
+          display: flex; justify-content: space-between;
+          font-size: 7.5px; font-weight: bold; color: #444;
+          border-top: 1px solid #cce0f5; padding-top: 3px; margin-top: 2px;
+        }
         .px-nb-pag-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
         .px-nb-pag-btn {
           background: #fffaf2; border: 2px solid #222; border-radius: 6px;
@@ -1099,12 +1181,31 @@
             <div id="px-nb-tabs">
               <button class="px-nb-tab px-nb-tab-active" data-tab="diary">Diary</button>
               <button class="px-nb-tab" data-tab="notebook">Notebook</button>
+              <button class="px-nb-tab" data-tab="timers">Timers</button>
             </div>
             <button id="px-notebook-modal-close" title="Close">×</button>
           </div>
           <div id="px-nb-diary-panel" class="px-nb-panel px-nb-panel-active">
+            <div id="px-nb-xp-section"></div>
             <div id="px-nb-diary-list"><div class="px-nb-loading">Loading…</div></div>
             <div id="px-nb-diary-pag" class="px-nb-pag-row"></div>
+          </div>
+          <div id="px-nb-act-timers-panel" class="px-nb-panel">
+            <div class="px-nb-section">
+              <div class="px-nb-section-header">Activity Timers</div>
+              <div id="px-nb-act-timers-list"><div class="px-nb-loading">Loading…</div></div>
+            </div>
+            <div class="px-nb-section">
+              <div class="px-nb-section-header">Manual Timers</div>
+              <div id="px-nb-timers-list"></div>
+              <div class="px-nb-add-row">
+                <input id="px-nb-timer-label" class="px-nb-input" type="text" placeholder="Timer label…" maxlength="100"/>
+                <input id="px-nb-timer-mins" class="px-nb-input px-nb-input-sm" type="number" placeholder="min" min="0.5" step="0.5"/>
+                <button class="px-nb-add-btn" id="px-nb-timer-add">Start</button>
+              </div>
+              <div class="px-nb-subsection-header">In-game offers</div>
+              <div id="px-nb-ingame-timers"></div>
+            </div>
           </div>
           <div id="px-nb-notebook-panel" class="px-nb-panel">
             <div class="px-nb-section">
@@ -1114,17 +1215,6 @@
                 <input id="px-nb-goal-input" class="px-nb-input" type="text" placeholder="New goal…" maxlength="200"/>
                 <button class="px-nb-add-btn" id="px-nb-goal-add">Add</button>
               </div>
-            </div>
-            <div class="px-nb-section">
-              <div class="px-nb-section-header">Timers</div>
-              <div id="px-nb-timers-list"></div>
-              <div class="px-nb-add-row">
-                <input id="px-nb-timer-label" class="px-nb-input" type="text" placeholder="Timer label…" maxlength="100"/>
-                <input id="px-nb-timer-mins" class="px-nb-input px-nb-input-sm" type="number" placeholder="min" min="0.5" step="0.5"/>
-                <button class="px-nb-add-btn" id="px-nb-timer-add">Start</button>
-              </div>
-              <div class="px-nb-subsection-header">In-game offers</div>
-              <div id="px-nb-ingame-timers"></div>
             </div>
             <div class="px-nb-section">
               <div class="px-nb-section-header">Shopping List</div>
@@ -1175,7 +1265,7 @@
       panel.querySelector('#px-close-btn').addEventListener('click', closePanel);
       panel.querySelector('#px-diary-btn').addEventListener('click', openNotebook);
       panel.querySelector('#px-premium-btn').addEventListener('click', togglePremiumModal);
-      panel.querySelector('#px-send').addEventListener('click', sendMessage);
+      panel.querySelector('#px-send').onclick = () => isBusy ? _stopMessage(_pendingQuestion) : sendMessage();
 
       // Persona picker — delegate from the row container
       panel.querySelector('#px-persona-row').addEventListener('click', e => {
@@ -1191,6 +1281,7 @@
         e.stopPropagation();
         e.stopImmediatePropagation();
         if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage(); }
+        if (e.key === 'Escape' && isBusy) { e.preventDefault(); _stopMessage(_pendingQuestion); }
       });
       inputEl.addEventListener('keyup',    e => { e.stopPropagation(); e.stopImmediatePropagation(); });
       inputEl.addEventListener('keypress', e => { e.stopPropagation(); e.stopImmediatePropagation(); });
@@ -1519,25 +1610,48 @@
     // ---- Send ----------------------------------------------------------------
     const PERSONA_DISPLAY_NAMES = { pixin: 'Pixin', goat: 'Royagi', cat: 'Nyanko' };
 
+    let _sendController  = null;  // AbortController for the in-flight /ask request
+    let _pendingQuestion = '';    // saved so Stop can restore it to the input
+    let _loadingMsgId    = null;  // id of the "thinking" bubble
+    let _sendUserStopped = false; // true when user clicked Stop (vs. timeout)
+
+    function _setSendStop(busy) {
+      isBusy = busy;
+      const input = document.getElementById('px-input');
+      const send  = document.getElementById('px-send');
+      if (input) input.disabled = busy;
+      if (send) {
+        send.innerHTML = busy ? '&#x25A0;' : '&#x27A4;'; // ■ vs ➤
+        send.title     = busy ? 'Stop' : 'Send';
+      }
+    }
+
+    function _stopMessage(question) {
+      if (!isBusy || !_sendController) return;
+      _sendUserStopped = true;
+      _pendingQuestion = question;
+      _sendController.abort();
+    }
+
     async function sendMessage() {
       if (isBusy) return;
       const input = document.getElementById('px-input');
-      const send  = document.getElementById('px-send');
-      if (!input || !send) return;
+      if (!input) return;
 
       const question = input.value.trim();
       if (!question) return;
 
-      input.value = '';
-      isBusy = true;
-      input.disabled = true;
-      send.disabled  = true;
+      input.value      = '';
+      _pendingQuestion = question;
+      _sendUserStopped = false;
+      _setSendStop(true);
 
       const personaName = PERSONA_DISPLAY_NAMES[currentPersona] ?? 'Pixin';
       appendMessage('player', question);
-      const loadingId = appendMessage(currentPersona, `${personaName} is thinking…`, 'px-msg-loading');
+      _loadingMsgId = appendMessage(currentPersona, `${personaName} is thinking…`, 'px-msg-loading');
 
       const controller = new AbortController();
+      _sendController  = controller;
       const timeoutId  = setTimeout(() => controller.abort(), 120_000);
 
       try {
@@ -1558,25 +1672,43 @@
 
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
-        updateMessage(loadingId, data.answer ?? data.text ?? data.response ?? '(no response)');
+        // Ignore late response if user stopped while awaiting json()
+        if (_sendUserStopped) return;
+        updateMessage(_loadingMsgId, data.answer ?? data.text ?? data.response ?? '(no response)');
       } catch (err) {
+        if (_sendUserStopped) return; // stop path handled in finally
         console.warn(TAG, '/ask fetch failed:', err);
         if (err.name === 'AbortError') {
-          updateMessage(loadingId, `${personaName} took too long to respond — please try again.`);
+          updateMessage(_loadingMsgId, `${personaName} took too long to respond — please try again.`);
         } else {
-          updateMessage(loadingId, 'Something went wrong — try again!');
+          updateMessage(_loadingMsgId, 'Something went wrong — try again!');
         }
       } finally {
         clearTimeout(timeoutId);
-        isBusy = false;
-        input.disabled = false;
-        send.disabled  = false;
-        if (isOpen) input.focus();
+        _sendController = null;
+        _setSendStop(false);
+        if (_sendUserStopped) {
+          const bubble = document.getElementById(_loadingMsgId);
+          if (bubble) bubble.remove();
+          const inp = document.getElementById('px-input');
+          if (inp) inp.value = _pendingQuestion;
+          _sendUserStopped = false;
+          _pendingQuestion = '';
+        } else if (isOpen) {
+          const inp = document.getElementById('px-input');
+          if (inp) inp.focus();
+        }
+        _loadingMsgId = null;
       }
     }
 
     // ---- Game event handler --------------------------------------------------
-    function onGameEvent({ type }) {
+    function onGameEvent({ type, message }) {
+      // Timer events are shown regardless of panel state (proactive notifications)
+      if (type === 'timerReady' || type === 'awayTimers') {
+        appendMessage(currentPersona, message ?? '');
+        return;
+      }
       if (!isOpen) return;
       if (type === 'taskboard ready to deliver') {
         appendMessage('pixin', '✓ Taskboard order ready to deliver!');
@@ -1718,7 +1850,8 @@
       notebookOpen = true;
       document.getElementById('px-notebook-modal').classList.add('px-modal-visible');
       diaryPage = 1;
-      if (notebookTab === 'diary') loadDiary(1);
+      if (notebookTab === 'diary') { loadDiary(1); renderTodayXp(); }
+      else if (notebookTab === 'timers') loadActivityTimers();
       else loadNotebook();
       startTimerCountdown();
     }
@@ -1730,14 +1863,323 @@
     }
 
     function switchNotebookTab(tab) {
-      if (tab !== 'diary' && tab !== 'notebook') return;
+      if (tab !== 'diary' && tab !== 'notebook' && tab !== 'timers') return;
       notebookTab = tab;
       document.querySelectorAll('.px-nb-tab').forEach(btn =>
         btn.classList.toggle('px-nb-tab-active', btn.dataset.tab === tab));
       document.getElementById('px-nb-diary-panel').classList.toggle('px-nb-panel-active', tab === 'diary');
       document.getElementById('px-nb-notebook-panel').classList.toggle('px-nb-panel-active', tab === 'notebook');
-      if (tab === 'diary') { diaryPage = 1; loadDiary(1); }
+      document.getElementById('px-nb-act-timers-panel').classList.toggle('px-nb-panel-active', tab === 'timers');
+      if (tab === 'diary') { diaryPage = 1; loadDiary(1); renderTodayXp(); }
+      else if (tab === 'timers') { loadActivityTimers(); loadNotebook(); }
       else loadNotebook();
+    }
+
+    // ---- Currency name + icon table (lazy-loaded once from /api/currencies) ---
+    // { id: { name, sprite } }  e.g. { 'cur_liveops': { name: 'Stuff Stub', sprite: '...' } }
+    let _diarycurrencies = null;
+    async function _loadCurrencies() {
+      if (_diarycurrencies) return _diarycurrencies;
+      try {
+        const r = await nbFetch('/api/currencies');
+        if (r.ok) _diarycurrencies = await r.json();
+      } catch (_) {}
+      return _diarycurrencies || {};
+    }
+
+    // Built-in fallback names so the UI never shows raw IDs even when /api/currencies is slow.
+    const _BUILTIN_CURRENCY_NAMES = {
+      'cur_pixel':        'Pixels',
+      'cur_$pixel':       'Pixels',
+      'cur_vpixel':       'vPixel',
+      'cur_coins':        'Coins',
+      'cur_liveops':      'Stuff Stub',
+      'cur_zoneztokens':  'Zonez Tokens',
+    };
+
+    function _tidyCurId(id) {
+      return (id.startsWith('cur_') ? id.slice(4) : id)
+        .replace(/[_-]/g, ' ')
+        .replace(/\b\w/g, c => c.toUpperCase());
+    }
+    function _curName(id) {
+      return _diarycurrencies?.[id]?.name ?? _BUILTIN_CURRENCY_NAMES[id] ?? _tidyCurId(id);
+    }
+    function _curSprite(id) {
+      return _diarycurrencies?.[id]?.sprite ?? null;
+    }
+
+    // Only cur_pixel / cur_$pixel (and bare variants) are the same Pixels currency.
+    // cur_vpixel is distinct and must NOT be merged.
+    const _PIXELS_IDS = new Set(['cur_pixel', 'cur_$pixel', 'pixel', '$pixel']);
+
+    // Format "2026-10-01" → "Today" / "Yesterday" / "Thu 1 Oct"
+    function _formatDiaryDate(isoDate) {
+      try {
+        const [y, m, d] = isoDate.split('-').map(Number);
+        const now = new Date();
+        const nowY = now.getFullYear(), nowM = now.getMonth() + 1, nowD = now.getDate();
+        if (y === nowY && m === nowM && d === nowD) return 'Today';
+        const yest = new Date(now); yest.setDate(now.getDate() - 1);
+        if (y === yest.getFullYear() && m === (yest.getMonth() + 1) && d === yest.getDate()) return 'Yesterday';
+        const dt = new Date(y, m - 1, d);
+        const days = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+        const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+        return `${days[dt.getDay()]} ${d} ${months[m - 1]}`;
+      } catch (_) { return isoDate; }
+    }
+
+    // Derive a currency ID from a legacy display name like "Cur Liveops" or "Cur $Pixel".
+    function _legacyNameToId(rawName) {
+      // Try exact name match in loaded currencies first.
+      if (_diarycurrencies) {
+        for (const [id, data] of Object.entries(_diarycurrencies)) {
+          if (data.name && data.name.toLowerCase() === rawName.toLowerCase()) return id;
+        }
+      }
+      // Heuristic: strip leading "Cur " (case-insensitive), lowercase, prepend "cur_".
+      const stripped = /^cur\s+/i.test(rawName) ? rawName.slice(rawName.indexOf(' ') + 1) : rawName;
+      return 'cur_' + stripped.toLowerCase().replace(/\s+/g, '_');
+    }
+
+    // Parse a legacy plain-text summary into change objects.
+    const _LEGACY_LINE_RE = /^([+\-−])([\d,]+)\s+(.+)$/;
+    function _parseLegacySummary(summary) {
+      const changes = [];
+      for (const line of (summary || '').split('\n')) {
+        const m = line.trim().match(_LEGACY_LINE_RE);
+        if (!m) continue;
+        const sign   = m[1] === '+' ? 1 : -1;
+        const amount = parseInt(m[2].replace(/,/g, ''), 10);
+        if (isNaN(amount)) continue;
+        const id = _legacyNameToId(m[3].trim());
+        changes.push({ type: 'currency', id, delta: sign * amount });
+      }
+      return changes;
+    }
+
+    // Shared: dedup Pixels, sort, and render a changes array into HTML.
+    function _renderChanges(changes) {
+      const seenPixelSign = new Set();
+      const deduped = [];
+      for (const c of changes) {
+        if (c.type === 'currency' && _PIXELS_IDS.has(c.id)) {
+          const sign = (c.delta ?? 0) >= 0 ? '+' : '-';
+          if (!seenPixelSign.has(sign)) {
+            seenPixelSign.add(sign);
+            deduped.push({ ...c, id: 'cur_pixel', _isPixels: true });
+          }
+        } else {
+          deduped.push(c);
+        }
+      }
+      // Gains first, losses last; skills at end
+      deduped.sort((a, b) => {
+        if (a.type === 'skill' && b.type !== 'skill') return 1;
+        if (b.type === 'skill' && a.type !== 'skill') return -1;
+        if (a.type === 'currency' && b.type === 'currency') {
+          const aGain = (a.delta ?? 0) >= 0, bGain = (b.delta ?? 0) >= 0;
+          if (aGain && !bGain) return -1;
+          if (!aGain && bGain) return 1;
+        }
+        return 0;
+      });
+      return '<div class="px-nb-diary-rows">' + deduped.map(c => {
+        if (c.type === 'skill') {
+          const label = (c.skill || '').replace(/([A-Z])/g, ' $1').replace(/\b\w/g, x => x.toUpperCase()).trim();
+          return `<div class="px-nb-diary-row px-nb-diary-skill">⬆ ${escapeHtml(label)} ${c.from}→${c.to}</div>`;
+        }
+        const id       = c.id || '';
+        const delta    = c.delta ?? 0;
+        const gain     = delta >= 0;
+        const sprite   = _curSprite(id);
+        const name     = c._isPixels ? 'Pixels' : _curName(id);
+        const amt      = Math.abs(delta).toLocaleString('en-US');
+        const sign     = gain ? '+' : '−';
+        const cls      = gain ? 'px-nb-diary-gain' : 'px-nb-diary-loss';
+        const iconHtml = sprite
+          ? `<img class="px-nb-diary-icon" src="${escapeHtml(sprite)}" alt="" loading="lazy">`
+          : '';
+        return `<div class="px-nb-diary-row">${iconHtml}<span class="${cls}">${sign}${amt}</span><span class="px-nb-diary-label">${escapeHtml(name)}</span></div>`;
+      }).join('') + '</div>';
+    }
+
+    // Render a single diary entry — structured (changes_json) or legacy (summary text).
+    function _renderDiaryEntry(e) {
+      const dateLabel = _formatDiaryDate(e.entry_date);
+      let rowsHtml = '';
+
+      if (e.changes_json) {
+        try {
+          rowsHtml = _renderChanges(JSON.parse(e.changes_json));
+        } catch (_) {
+          rowsHtml = `<div class="px-nb-diary-text">${escapeHtml(e.summary)}</div>`;
+        }
+      } else {
+        // Legacy entry: try to parse text lines into structured changes.
+        const changes = _parseLegacySummary(e.summary);
+        if (changes.length > 0) {
+          rowsHtml = _renderChanges(changes);
+        } else {
+          rowsHtml = `<div class="px-nb-diary-text">${escapeHtml(e.summary)}</div>`;
+        }
+      }
+
+      return `<div class="px-nb-diary-card">
+        <div class="px-nb-diary-date">${escapeHtml(dateLabel)}</div>
+        ${rowsHtml}
+      </div>`;
+    }
+
+    // ---- XP Per Day ---------------------------------------------------------
+
+    // Returns "YYYY-MM-DD" in local time
+    function _todayKey() {
+      const d = new Date();
+      const mm = String(d.getMonth() + 1).padStart(2, '0');
+      const dd = String(d.getDate()).padStart(2, '0');
+      return `${d.getFullYear()}-${mm}-${dd}`;
+    }
+
+    // Returns the date key for yesterday
+    function _yesterdayKey() {
+      const d = new Date(Date.now() - 86_400_000);
+      const mm = String(d.getMonth() + 1).padStart(2, '0');
+      const dd = String(d.getDate()).padStart(2, '0');
+      return `${d.getFullYear()}-${mm}-${dd}`;
+    }
+
+    // Skill names to exclude from XP tracking
+    const _XP_SKIP = new Set(['total', 'overall', 'Total', 'Overall']);
+
+    // Prettify camelCase skill name → "Title Case"
+    function _skillLabel(name) {
+      return name
+        .replace(/([a-z])([A-Z])/g, '$1 $2')
+        .replace(/\b\w/g, c => c.toUpperCase())
+        .trim();
+    }
+
+    // Save baseline XP for today if not already saved; prune keys older than 7 days.
+    async function _maybeSetXpBaseline(playerId, skills) {
+      const storageKey = `xpBaseline_${playerId}`;
+      let baselines = (await storageGetKey(storageKey)) ?? {};
+      const today = _todayKey();
+      if (!baselines[today]) {
+        // First read this local day — set baseline
+        const snapshot = {};
+        for (const [skill, data] of Object.entries(skills)) {
+          if (_XP_SKIP.has(skill)) continue;
+          snapshot[skill] = { xp: data.totalExp ?? 0, level: data.level ?? 0 };
+        }
+        baselines[today] = snapshot;
+        // Prune to last 7 days
+        const keys = Object.keys(baselines).sort();
+        while (keys.length > 7) {
+          delete baselines[keys.shift()];
+        }
+        await storageSetKey(storageKey, baselines);
+      }
+    }
+
+    // Compute XP gained for a given day vs baseline; returns sorted array.
+    function _computeXpGains(skills, baseline) {
+      const gains = [];
+      for (const [skill, cur] of Object.entries(skills)) {
+        if (_XP_SKIP.has(skill)) continue;
+        const base = baseline[skill];
+        if (!base) continue;
+        const xpGain = (cur.totalExp ?? 0) - base.xp;
+        if (xpGain <= 0) continue;
+        gains.push({
+          skill,
+          xpGain,
+          fromLevel: base.level,
+          toLevel:   cur.level ?? base.level,
+        });
+      }
+      gains.sort((a, b) => b.xpGain - a.xpGain);
+      return gains;
+    }
+
+    // Render XP gains into the #px-nb-xp-section element.
+    // viewKey: 'today' | 'yesterday'
+    let _xpViewKey = 'today';
+
+    async function renderTodayXp() {
+      const el = document.getElementById('px-nb-xp-section');
+      if (!el) return;
+      const playerId = nbPlayerId();
+      if (!playerId) { el.innerHTML = ''; return; }
+
+      const skills = latestPlayerContext?.skills ?? {};
+      if (Object.keys(skills).length === 0) { el.innerHTML = ''; return; }
+
+      const storageKey = `xpBaseline_${playerId}`;
+      const baselines  = (await storageGetKey(storageKey)) ?? {};
+      const todayKey   = _todayKey();
+      const yestKey    = _yesterdayKey();
+      const hasYest    = !!baselines[yestKey];
+
+      // Save baseline if first read today
+      await _maybeSetXpBaseline(playerId, skills);
+      const freshBaselines = (await storageGetKey(storageKey)) ?? baselines;
+
+      const isYest    = _xpViewKey === 'yesterday' && hasYest;
+      const dateKey   = isYest ? yestKey : todayKey;
+      const baseline  = freshBaselines[dateKey];
+
+      // For yesterday we use yesterday's baseline vs. today's baseline as the "current"
+      let displaySkills = skills;
+      if (isYest && freshBaselines[todayKey]) {
+        // yesterday's gains = today's baseline - yesterday's baseline
+        const todayBase = freshBaselines[todayKey];
+        const tempSkills = {};
+        for (const [s, b] of Object.entries(todayBase)) {
+          tempSkills[s] = { totalExp: b.xp, level: b.level };
+        }
+        displaySkills = tempSkills;
+      }
+
+      let bodyHtml = '';
+      if (!baseline) {
+        bodyHtml = '<div class="px-nb-empty">No baseline data yet.</div>';
+      } else {
+        const gains = _computeXpGains(displaySkills, baseline);
+        if (gains.length === 0) {
+          bodyHtml = `<div class="px-nb-empty">No XP yet ${isYest ? 'yesterday' : 'today'} — go do something!</div>`;
+        } else {
+          const rows = gains.map(g => {
+            const levelUp = g.toLevel > g.fromLevel
+              ? `<span class="px-xp-lvlup">Lv ${g.fromLevel}→${g.toLevel} 🎉</span>` : '';
+            return `<div class="px-xp-row">
+              <span class="px-xp-skill">${escapeHtml(_skillLabel(g.skill))}</span>
+              ${levelUp}
+              <span class="px-xp-gain">+${g.xpGain.toLocaleString('en-US')} XP</span>
+            </div>`;
+          }).join('');
+          const total = gains.reduce((s, g) => s + g.xpGain, 0);
+          bodyHtml = rows + `<div class="px-xp-total"><span>Total</span><span>+${total.toLocaleString('en-US')} XP</span></div>`;
+        }
+      }
+
+      const yestBtn = hasYest
+        ? `<button class="px-xp-toggle" id="px-xp-toggle-btn">${isYest ? 'Today' : 'Yesterday'}</button>`
+        : '';
+      const title = isYest ? "Yesterday's XP" : "Today's XP";
+
+      el.innerHTML = `<div class="px-xp-card">
+        <div class="px-xp-header"><span>${escapeHtml(title)}</span>${yestBtn}</div>
+        ${bodyHtml}
+      </div>`;
+
+      const toggleBtn = el.querySelector('#px-xp-toggle-btn');
+      if (toggleBtn) {
+        toggleBtn.addEventListener('click', () => {
+          _xpViewKey = isYest ? 'today' : 'yesterday';
+          renderTodayXp();
+        });
+      }
     }
 
     async function loadDiary(page) {
@@ -1747,18 +2189,16 @@
       if (!playerId) { container.innerHTML = '<div class="px-nb-empty">Player ID not available yet.</div>'; return; }
       container.innerHTML = '<div class="px-nb-loading">Loading…</div>';
       try {
-        const res = await nbFetch(`/api/diary?playerId=${encodeURIComponent(playerId)}&page=${page}`);
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const { entries, pages } = await res.json();
+        const [diaryRes] = await Promise.all([
+          nbFetch(`/api/diary?playerId=${encodeURIComponent(playerId)}&page=${page}`),
+          _loadCurrencies(),
+        ]);
+        if (!diaryRes.ok) throw new Error('HTTP ' + diaryRes.status);
+        const { entries, pages } = await diaryRes.json();
         if (!entries || entries.length === 0) {
           container.innerHTML = '<div class="px-nb-empty">No diary entries yet. Play and use the companion to generate entries.</div>';
         } else {
-          container.innerHTML = entries.map(e =>
-            `<div class="px-nb-diary-card">
-              <div class="px-nb-diary-date">${escapeHtml(e.entry_date)}</div>
-              <div class="px-nb-diary-text">${escapeHtml(e.summary)}</div>
-            </div>`
-          ).join('');
+          container.innerHTML = entries.map(e => _renderDiaryEntry(e)).join('');
         }
         const pag = document.getElementById('px-nb-diary-pag');
         if (pag) {
@@ -1786,6 +2226,111 @@
       }
     }
 
+    async function loadActivityTimers() {
+      const listEl = document.getElementById('px-nb-act-timers-list');
+      if (!listEl) return;
+      const playerId = nbPlayerId();
+      if (!playerId) {
+        listEl.innerHTML = '<div class="px-nb-empty">Sign in to see timers.</div>';
+        return;
+      }
+      try {
+        const timers = (await storageGetKey(`activityTimers_${playerId}`)) ?? [];
+        console.log(`[timers] UI loaded ${timers.length} timer(s)`);
+        if (timers.length === 0) {
+          listEl.innerHTML = '<div class="px-nb-empty">No active timers. Plant a crop, start a craft or use a mine to see timers here.</div>';
+          return;
+        }
+        const now = Date.now();
+        // Ready-first, then by soonest readyAt
+        timers.sort((a, b) => {
+          const aReady = a.readyAt <= now, bReady = b.readyAt <= now;
+          if (aReady !== bReady) return aReady ? -1 : 1;
+          return a.readyAt - b.readyAt;
+        });
+
+        // Group: same itemLabel + mapId with readyAt within 60 s of each other
+        const groups = [];
+        for (const t of timers) {
+          const last = groups[groups.length - 1];
+          if (last
+              && last.itemLabel === t.itemLabel
+              && last.mapId    === t.mapId
+              && t.readyAt - last.minReadyAt <= 60_000) {
+            last.members.push(t);
+            last.maxReadyAt = Math.max(last.maxReadyAt, t.readyAt);
+          } else {
+            groups.push({
+              itemLabel: t.itemLabel, landLabel: t.landLabel, mapId: t.mapId,
+              minReadyAt: t.readyAt, maxReadyAt: t.readyAt, members: [t],
+            });
+          }
+        }
+
+        listEl.innerHTML = groups.map((g, gi) => {
+          const count   = g.members.length;
+          const ready   = g.maxReadyAt <= now;
+          const ms      = g.maxReadyAt - now;
+          const timeStr = ready ? 'READY — collect' : _fmtCountdown(ms);
+          const label   = count > 1
+            ? `${_esc(g.itemLabel)} ×${count} · ${_esc(g.landLabel)}`
+            : `${_esc(g.itemLabel)} · ${_esc(g.landLabel)}`;
+          const groupId = `px-act-g-${gi}`;
+          const expandBtn = count > 1
+            ? `<button class="px-nb-timer-expand" data-group="${groupId}" title="Show individual">+</button>` : '';
+          const childRows = count > 1
+            ? `<div id="${groupId}" class="px-nb-timer-children" style="display:none">${
+                g.members.map(t => {
+                  const tr = t.readyAt <= now;
+                  return `<div class="px-nb-timer-row px-nb-timer-child ${tr ? 'px-nb-timer-ready' : ''}">
+                    <span class="px-nb-timer-item">${_esc(t.itemLabel)}</span>
+                    <span class="px-nb-timer-land">${_esc(t.landLabel)}</span>
+                    <span class="px-nb-timer-status">${tr ? 'READY' : _fmtCountdown(t.readyAt - now)}</span>
+                  </div>`;
+                }).join('')
+              }</div>` : '';
+          return `<div class="px-nb-timer-row ${ready ? 'px-nb-timer-ready' : ''}">
+            ${expandBtn}
+            <span class="px-nb-timer-item">${label}</span>
+            <span class="px-nb-timer-status">${timeStr}</span>
+          </div>${childRows}`;
+        }).join('');
+
+        // Wire expand buttons
+        listEl.querySelectorAll('.px-nb-timer-expand').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const children = document.getElementById(btn.dataset.group);
+            if (!children) return;
+            const open = children.style.display !== 'none';
+            children.style.display = open ? 'none' : 'block';
+            btn.textContent = open ? '+' : '−';
+          });
+        });
+      } catch (e) {
+        listEl.innerHTML = '<div class="px-nb-empty">Could not load timers.</div>';
+      }
+    }
+
+    // Live-refresh timers panel whenever injected.js pushes an update.
+    window.addEventListener('px-timers-updated', () => {
+      if (notebookOpen && notebookTab === 'timers') loadActivityTimers();
+    });
+
+    function _fmtCountdown(ms) {
+      if (ms <= 0) return 'READY';
+      const s = Math.floor(ms / 1000);
+      const h = Math.floor(s / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      const sec = s % 60;
+      if (h > 0) return `${h}h ${m}m`;
+      if (m > 0) return `${m}m ${sec}s`;
+      return `${sec}s`;
+    }
+
+    function _esc(str) {
+      return String(str ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
     async function loadNotebook() {
       const playerId = nbPlayerId();
       if (!playerId) {
@@ -1807,17 +2352,44 @@
       }
     }
 
+    // Fill <level> placeholder in goal text using current player skills.
+    // Looks for a skill name in the surrounding text, replaces with currentLevel+1.
+    // Returns { text, filled } — filled=false means <level> remains unfilled.
+    function _fillGoalPlaceholders(text) {
+      if (!/<level>/i.test(text)) return { text, filled: true };
+      const skills = latestPlayerContext?.skills ?? {};
+      const skillKeys = Object.keys(skills); // e.g. "cooking", "woodworking"
+      // For each <level> occurrence, scan surrounding words for a skill name match
+      const filled = text.replace(/<level>/gi, (match, offset) => {
+        const prefix = text.slice(0, offset).toLowerCase();
+        // Try to match a skill key as the last word-sequence before <level>
+        // Check longest names first so "woodworking" beats "wood"
+        const sorted = skillKeys.slice().sort((a, b) => b.length - a.length);
+        for (const key of sorted) {
+          const keyNorm = key.toLowerCase().replace(/[_-]/g, ' ');
+          if (prefix.includes(keyNorm)) {
+            const lvl = skills[key]?.level ?? 0;
+            return String(lvl + 1);
+          }
+        }
+        return match; // could not fill
+      });
+      return { text: filled, filled: !/<level>/i.test(filled) };
+    }
+
     function renderGoals(goals) {
       const container = document.getElementById('px-nb-goals-list');
       if (!container) return;
       if (goals.length === 0) { container.innerHTML = '<div class="px-nb-empty">No goals yet.</div>'; return; }
-      container.innerHTML = goals.map(g =>
-        `<div class="px-nb-goal-item" data-id="${g.id}">
+      container.innerHTML = goals.map(g => {
+        const { text: displayText, filled } = _fillGoalPlaceholders(g.text);
+        const needsEdit = !filled; // still has <level> we couldn't resolve
+        return `<div class="px-nb-goal-item" data-id="${g.id}">
           <input type="checkbox" class="px-nb-goal-check" ${g.completed ? 'checked' : ''} data-id="${g.id}"/>
-          <span class="px-nb-goal-text${g.completed ? ' px-nb-goal-done' : ''}">${escapeHtml(g.text)}</span>
+          <span class="px-nb-goal-text${g.completed ? ' px-nb-goal-done' : ''}">${escapeHtml(displayText)}${needsEdit ? ' <span class="px-nb-goal-warn" title="This goal contains an unfilled placeholder — please edit it">⚠ edit me</span>' : ''}</span>
           <button class="px-nb-del-btn" data-id="${g.id}" data-type="goal">✕</button>
-        </div>`
-      ).join('');
+        </div>`;
+      }).join('');
       container.querySelectorAll('.px-nb-goal-check').forEach(cb =>
         cb.addEventListener('change', () => toggleGoalItem(Number(cb.dataset.id), cb.checked)));
       container.querySelectorAll('.px-nb-del-btn[data-type="goal"]').forEach(btn =>
@@ -1910,7 +2482,8 @@
       const input = document.getElementById('px-nb-goal-input');
       const playerId = nbPlayerId();
       if (!input || !playerId || !input.value.trim()) return;
-      const text = input.value.trim(); input.value = '';
+      const raw = input.value.trim(); input.value = '';
+      const { text } = _fillGoalPlaceholders(raw);
       try {
         const res = await nbFetch('/api/goals', { method: 'POST', body: JSON.stringify({ playerId, text }) });
         if (!res.ok) throw new Error('HTTP ' + res.status);
@@ -1983,11 +2556,19 @@
     }
 
     // Expose the things dispatch() needs to reach.
+    function onPlayerContext(data) {
+      // Live-refresh XP section if diary tab is open
+      if (notebookOpen && notebookTab === 'diary') {
+        renderTodayXp();
+      }
+    }
+
     return {
       get latestPlayerContext() { return latestPlayerContext; },
       set latestPlayerContext(v) { latestPlayerContext = v; },
       onGameEvent,
       onCameraFrame,
+      onPlayerContext,
     };
   })();
 

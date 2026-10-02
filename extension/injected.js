@@ -359,7 +359,7 @@
     const entities = room?.state?.entities;
     if (!entities || typeof entities.forEach !== 'function') return null;
 
-    const library = global.gameLibrary?.entities;
+    const library = globalThis.gameLibrary?.entities;
     if (!library) return null;
 
     const result = [];
@@ -380,6 +380,53 @@
       });
     });
     return result;
+  }
+
+  // Read a named field from generic.statics — handles plain object, native Array,
+  // and Colyseus ArraySchema (which has .find() but may not pass Array.isArray()).
+  function _readStaticsProp(statics, name) {
+    if (!statics) return undefined;
+    if (typeof statics.find === 'function') {
+      try {
+        const entry = statics.find(e => e != null && e.name === name);
+        return entry !== undefined ? entry.value : undefined;
+      } catch (_) {}
+    }
+    return statics[name];
+  }
+
+  // Count soil entities in room.state.entities, grouped by tier.
+  // Returns an object like {4: 62, 3: 10} — empty object when no soil entities found.
+  // Matches any entity whose ID contains "soil" (e.g. ent_farm_soil_04) with a _NN suffix.
+  function readSoilState(room) {
+    const entities = room?.state?.entities;
+    if (!entities || typeof entities.forEach !== 'function') return {};
+
+    const tierCounts = {};
+    entities.forEach((mapEntity) => {
+      if (!mapEntity?.entity) return;
+      const id = mapEntity.entity.toLowerCase();
+
+      // Legacy: ent_farm_soil_04 style — read tier from numeric suffix
+      if (id.includes('soil')) {
+        const m = id.match(/_(\d{2})$/);
+        if (m) {
+          const tier = parseInt(m[1], 10);
+          if (tier > 0) tierCounts[tier] = (tierCounts[tier] ?? 0) + 1;
+          return;
+        }
+      }
+
+      // New: ent_allcrops — read soilTier from generic.statics (may be ArraySchema)
+      if (/allcrops|crop|plot/i.test(id)) {
+        const soilTierRaw = _readStaticsProp(mapEntity?.generic?.statics, 'soilTier');
+        if (soilTierRaw != null) {
+          const tier = parseInt(String(soilTierRaw), 10);
+          if (!isNaN(tier) && tier > 0) tierCounts[tier] = (tierCounts[tier] ?? 0) + 1;
+        }
+      }
+    });
+    return tierCounts;
   }
 
   // Read GMapPermissions from room.state.mapPermissions.
@@ -408,12 +455,13 @@
   }
 
   // Shape extraction records into the canonical land snapshot object.
-  function shapeLandSnapshot(mapId, industries, permissions) {
+  function shapeLandSnapshot(mapId, industries, permissions, soilTiers) {
     return {
       landId:      mapId,
       observedAt:  Date.now(),
       permissions: permissions ?? { use: [], useByIndustry: {} },
       industries:  industries  ?? [],
+      soilTiers:   soilTiers   ?? {},
     };
   }
 
@@ -425,6 +473,7 @@
       landId:      snapshot.landId,
       permissions: snapshot.permissions,
       industries:  snapshot.industries,
+      soilTiers:   snapshot.soilTiers,
     });
   }
 
@@ -556,37 +605,111 @@
   }
 
   // ---------------------------------------------------------------------------
-  // Phaser.Game constructor Proxy
+  // Phaser.Game constructor Proxy — coexistence-safe
+  // Works alongside other extensions (e.g. PGA) that also hook Phaser.Game:
+  //   • chains any existing window.Phaser setter rather than overwriting it
+  //   • wraps (not replaces) whatever Phaser.Game currently is — even a proxy
+  //   • polls as a fallback so startup survives a setter overwrite
   // ---------------------------------------------------------------------------
-  function hookPhaserGame(Phaser) {
-    console.log(TAG, 'Phaser detected — version:', Phaser?.VERSION);
+  let _pollingStarted = false;
+  const _hookedConstructors = new WeakSet();
 
-    Phaser.Game = new Proxy(Phaser.Game, {
+  function attachOnce(game, via) {
+    if (_pollingStarted) return;
+    _pollingStarted = true;
+    console.log(TAG, '[init] attached via', via);
+    startPolling(game);
+  }
+
+  function hookPhaserGame(Phaser) {
+    const prevGame = Phaser?.Game;
+    if (!prevGame || _hookedConstructors.has(prevGame)) return;
+    console.log(TAG, '[init] Phaser detected — version:', Phaser?.VERSION);
+    const proxy = new Proxy(prevGame, {
       construct(target, args) {
         const instance = Reflect.construct(target, args);
-        console.log(TAG, 'Phaser.Game instance captured.');
-        startPolling(instance);
+        attachOnce(instance, 'constructor hook');
         return instance;
       },
     });
+    _hookedConstructors.add(prevGame);
+    _hookedConstructors.add(proxy);
+    Phaser.Game = proxy;
+  }
+
+  function tryAttachExisting(Phaser) {
+    if (_pollingStarted || !Phaser) return false;
+    const games = Phaser.GAMES;
+    if (Array.isArray(games)) {
+      for (const g of games) {
+        if (g && !g.isDestroyed) {
+          attachOnce(g, 'existing game (Phaser.GAMES)');
+          return true;
+        }
+      }
+    }
+    return false;
+  }
+
+  function handlePhaserReady(Phaser) {
+    if (!Phaser) return;
+    hookPhaserGame(Phaser);
+    tryAttachExisting(Phaser);
   }
 
   // ---------------------------------------------------------------------------
-  // window.Phaser trap
-  // Locks permanently on first fire so a subsequent write (e.g. a framework
-  // stub being replaced by the real library) can't silently displace our hook.
+  // window.Phaser trap — chains any existing setter (e.g. from PGA extension)
   // ---------------------------------------------------------------------------
   if (window.Phaser) {
-    hookPhaserGame(window.Phaser);
+    handlePhaserReady(window.Phaser);
   } else {
-    Object.defineProperty(window, 'Phaser', {
-      configurable: true,
-      set(value) {
-        Object.defineProperty(window, 'Phaser', { value });
-        hookPhaserGame(value);
-      },
-    });
+    const _existingPhaserDesc = Object.getOwnPropertyDescriptor(window, 'Phaser');
+    const _prevPhaserSetter = typeof _existingPhaserDesc?.set === 'function'
+      ? _existingPhaserDesc.set : null;
+    if (_prevPhaserSetter) {
+      console.log(TAG, '[init] chaining existing window.Phaser setter');
+    }
+    try {
+      Object.defineProperty(window, 'Phaser', {
+        configurable: true,
+        enumerable: true,
+        set(value) {
+          if (_prevPhaserSetter) {
+            try { _prevPhaserSetter.call(window, value); } catch (_) {}
+          }
+          try {
+            Object.defineProperty(window, 'Phaser', {
+              value, configurable: true, writable: true, enumerable: true,
+            });
+          } catch (_) {}
+          handlePhaserReady(value);
+        },
+      });
+    } catch (e) {
+      console.log(TAG, '[init] defineProperty on window.Phaser failed:', e);
+    }
   }
+
+  // ---------------------------------------------------------------------------
+  // Startup polling fallback — every 500 ms for up to 30 s.
+  // Catches: (a) game already running when extension loads, (b) another
+  // extension overwrote our setter without chaining, (c) any other edge case.
+  // ---------------------------------------------------------------------------
+  let _startupPollCount = 0;
+  const _startupPollInterval = setInterval(() => {
+    _startupPollCount++;
+    if (_pollingStarted || _startupPollCount > 60) {
+      clearInterval(_startupPollInterval);
+      if (!_pollingStarted) {
+        console.log(TAG, '[init] startup timeout — game not detected after 30s');
+      }
+      return;
+    }
+    const Ph = window.Phaser;
+    if (!Ph) return;
+    hookPhaserGame(Ph);
+    tryAttachExisting(Ph);
+  }, 500);
 
   // ---------------------------------------------------------------------------
   // Pollers — started once the Phaser.Game instance is captured.
@@ -597,6 +720,542 @@
 
     function getScene() {
       return game.scene.scenes[1];
+    }
+
+    // ---- Activity timers — declared at TOP before any handler ---------------
+    // IMPORTANT: these must stay before every closure/handler that references them.
+    const _actTimers         = new Map();  // entityMid → {entityMid,entityLabel,itemLabel,landLabel,mapId,startedAt,readyAt}
+    const _notifiedTimerIds  = new Set();  // entity mids for which ready notification was sent
+    // _dumpedEntityTypes intentionally NOT pre-populated — reset on page load so each
+    // entity type is always dumped fresh, giving visibility into current field shapes.
+    const _dumpedEntityTypes = new Set();
+    let   _lastViewedRecipe  = null;       // most recent recipe panel scan; used for craft item name
+    let   _lastIngredientActionAt = 0;     // epoch ms of last inventory-consuming action
+    let   _staticsTick       = 0;          // incremented on every _scanStaticsCraftTimers call
+    let   _craftCaptureUntil = 0;          // epoch ms — log ALL sends+msgs until this time
+    const _knownPresentUIStates = new Set();  // presentUI params[1] values seen (one-time log)
+    const _lastClickEntityInfo  = new Map();  // click mid → {typeId, ts}
+    const _loggedCatalogMisses  = new Set();  // item ids logged as catalog misses
+
+    // plotSeeds: "mapId:entityMid" → seedItemId — detected from inventory drop at plant time.
+    // Persisted via extension storage so labels survive page refreshes.
+    let _plotSeeds = {};
+
+    // Batch counter for "not started — entity idle/empty" log noise reduction.
+    let _emptyPlotBatchCount = 0;
+    let _emptyPlotBatchTimer = null;
+    function _logEmptyPlotBatch() {
+      if (_emptyPlotBatchTimer) clearTimeout(_emptyPlotBatchTimer);
+      _emptyPlotBatchTimer = setTimeout(() => {
+        if (_emptyPlotBatchCount > 0) {
+          console.log(`[timers] ${_emptyPlotBatchCount} plot${_emptyPlotBatchCount === 1 ? '' : 's'} empty (harvested)`);
+          _emptyPlotBatchCount = 0;
+        }
+        _emptyPlotBatchTimer = null;
+      }, 2000);
+    }
+
+    function _savePlotSeeds() {
+      try { saveToCompanion('plotSeeds', { seeds: _plotSeeds }); } catch (_) {}
+    }
+
+    // Read a named field from generic.statics — handles plain object, native Array,
+    // and Colyseus ArraySchema (uses module-level _readStaticsProp).
+    function _staticsGet(statics, name) {
+      return _readStaticsProp(statics, name);
+    }
+
+    // Scans crop entities for active grow timers (inUseBy/pid == me).
+    let _staticsScanSig = '';  // last logged scan signature to detect changes
+
+    function _scanStaticsCraftTimers() {
+      try {
+        _staticsTick++;
+        const room = getScene()?.stateManager?.room;
+        if (!room?.state?.entities) return;
+        const playerId = ctx.playerId;
+        if (!playerId) {
+          console.warn('[timers] statics scan: ctx.playerId is empty — skipping');
+          return;
+        }
+        const now     = Date.now();
+        const mapId   = String(getScene()?.stateManager?.mapId ?? 'unknown');
+
+        let cntEntities = 0, cntWithStatics = 0, cntPidSet = 0, cntMine = 0;
+        let cntAllcrops = 0; // total allcrops entities seen this scan (for diagnostics)
+
+        const activeMids = new Set(); // mids of all crop timers still live this scan
+        let changed = false;
+
+        room.state.entities.forEach((entity) => {
+          try {
+            cntEntities++;
+            const statics = entity?.generic?.statics;
+            // Allow null/undefined statics through for crop entities — we still want to count them.
+            const typeId = String(entity?.entity ?? '');
+            const mid    = String(entity?.mid ?? entity?.id ?? '');
+            if (!mid) return;
+
+            // ---- CROP TIMERS ------------------------------------------------
+            if (/allcrops|crop|plot|farm/i.test(typeId)) {
+              cntAllcrops++;
+              // Diagnostic: log first 3 allcrops per scan while crops=0 (debug only)
+              if (window.PX_COMPANION_DEBUG && cntMine === 0 && cntAllcrops <= 3) {
+                const dbgInUseBy = _staticsGet(statics, 'inUseBy');
+                const dbgState   = entity?.generic?.state ?? '(none)';
+                const isArr      = Array.isArray(statics);
+                const hasFindFn  = typeof statics?.find === 'function';
+                console.log(`[timers] allcrops[${cntAllcrops}] mid=${mid} inUseBy=${dbgInUseBy ?? 'null'} state=${dbgState} isArray=${isArr} hasFindFn=${hasFindFn}`);
+              }
+              if (!statics || typeof statics !== 'object') return;
+              cntWithStatics++;
+              // Match: inUseBy or pid equals playerId — statics may be array [{name,value}] or object
+              const inUseBy = _staticsGet(statics, 'inUseBy') ?? null;
+              const cropPid = _staticsGet(statics, 'pid') ?? _staticsGet(statics, 'playerId') ?? null;
+              const mine    = (inUseBy  && String(inUseBy).trim()  === String(playerId).trim())
+                           || (cropPid  && String(cropPid).trim()  === String(playerId).trim());
+              if (!mine) return;
+
+              cntPidSet++;
+              cntMine++;
+              activeMids.add(mid);
+
+              const utcTarget    = entity?.generic?.displayInfo?.utcTarget ?? null;
+              const state        = String(entity?.generic?.state ?? '').toLowerCase();
+              const fruitItem    = _staticsGet(statics, 'fruitItem') ?? null;
+              const seedItem     = _staticsGet(statics, 'seedItem') ?? null;
+              const minutesNeeded = _staticsGet(statics, 'minutesNeeded') ?? null;
+              const cropLabel    = _resolveCropLabel(fruitItem, seedItem);
+              const landLabel    = _landLabelFor(mapId);
+
+              let readyAt   = null;
+              let estimated = false;
+
+              if (utcTarget && utcTarget > now) {
+                readyAt = utcTarget;
+              } else if (/planted|growing/i.test(state) && minutesNeeded) {
+                readyAt   = now + Number(minutesNeeded) * 60_000;
+                estimated = true;
+              } else if (/grown|ready|harvest/i.test(state)) {
+                // Already harvestable — mark ready but keep listed
+                const ex = _actTimers.get(mid);
+                if (ex && ex.readyAt > now) { ex.readyAt = now - 1; changed = true; }
+                return;
+              } else {
+                return; // no usable time info yet
+              }
+
+              const existing = _actTimers.get(mid);
+              const readyAtChanged = !existing || existing.readyAt !== readyAt;
+              const labelChanged   = !existing || existing.itemLabel !== cropLabel;
+              if (!readyAtChanged && !labelChanged) return; // no change
+
+              if (existing?.estimated && !estimated) {
+                console.log(`[timers] crop upgraded est→real: ${cropLabel} readyAt=${new Date(readyAt).toISOString()}`);
+              } else if (!existing) {
+                console.log(`[timers] crop scan: ${cropLabel} on ${landLabel}${estimated ? ' (est.)' : ''} readyAt=${new Date(readyAt).toISOString()}`);
+              } else if (labelChanged) {
+                console.log(`[timers] crop relabeled: ${existing.itemLabel}→${cropLabel}`);
+              }
+              _actTimers.set(mid, {
+                entityMid: mid, entityLabel: 'crop', source: 'crop',
+                itemLabel: cropLabel, landLabel, mapId,
+                startedAt: existing?.startedAt ?? now,
+                readyAt, estimated: !!estimated,
+              });
+              _notifiedTimerIds.delete(mid);
+              return;
+            }
+
+          } catch (_) {}
+        });
+
+        // Log summary when counts change
+        const sig = `${mapId}|${cntEntities}|${cntWithStatics}|${cntPidSet}|${cntMine}`;
+        if (sig !== _staticsScanSig) {
+          _staticsScanSig = sig;
+          console.log(`[timers] statics scan: map=${mapId} entities=${cntEntities} withStatics=${cntWithStatics} crops=${cntMine} playerId=${playerId}`);
+        }
+        // Periodic heartbeat every 6th tick (~1 min at 10s interval)
+        if (_staticsTick % 6 === 0) {
+          console.log(`[timers] statics tick ${_staticsTick} map=${mapId} crops=${cntMine}`);
+        }
+
+        // Safer cleanup: only clear a crop timer if the plot entity is found on the current
+        // map AND its state is explicitly empty/idle. If grown/ready, mark Ready but keep.
+        for (const [mid, timer] of _actTimers) {
+          if (timer.mapId !== mapId) continue; // different map — preserve
+          if (timer.source !== 'crop') continue;
+          if (activeMids.has(mid)) continue;    // still active this scan — no action needed
+          // Check entity state directly
+          let ent = null;
+          room.state.entities.forEach((e) => {
+            if (!ent && String(e?.mid ?? e?.id ?? '') === mid) ent = e;
+          });
+          if (!ent) continue; // not in room — keep timer (might be multi-map)
+          const entState = String(ent?.generic?.state ?? '').toLowerCase();
+          if (/grown|ready|harvest/i.test(entState)) {
+            if (timer.readyAt > now) { timer.readyAt = now - 1; changed = true; }
+          } else if (!entState || /empty|idle|bare|fallow/i.test(entState)) {
+            _actTimers.delete(mid);
+            _notifiedTimerIds.delete(mid);
+            console.log(`[timers] cleared (empty plot): crop ${timer.itemLabel} mid=${mid}`);
+            changed = true;
+          }
+        }
+
+        if (activeMids.size > 0 || changed) _syncTimers();
+      } catch (e) { console.error('[timers] statics scan error:', e); }
+    }
+
+    // itemId → display name, e.g. "itm_popberrySeeds" → "Popberry Seeds"
+    // Populated in _fetchLibItems alongside _nameMap.
+    let _itemIdToName = {};
+
+    // Friendly station/entity type labels for timer display.
+    // Returns null for unknown types so presentUI handler can fall back to skill name.
+    function _friendlyEntityLabel(entityTypeId) {
+      if (!entityTypeId) return null;
+      const t = String(entityTypeId).toLowerCase();
+      if (/allcrops|crop|plot|farm/i.test(t))    return 'Crop';
+      if (/woodwork/i.test(t))                   return 'Woodwork';
+      if (/metalwork/i.test(t))                  return 'Metalworking';
+      if (/winery/i.test(t))                     return 'Winery';
+      if (/textile/i.test(t))                    return 'Textile';
+      if (/stove|oven|kitchen|cook/i.test(t))    return 'Stove';
+      if (/forge|anvil|smith/i.test(t))          return 'Forge';
+      if (/mine|rock|ore|stone/i.test(t))        return 'Mine';
+      if (/loom|weav|fabric/i.test(t))           return 'Loom';
+      if (/barrel|brew|ferment/i.test(t))        return 'Brew';
+      if (/press|juice|extract/i.test(t))        return 'Press';
+      if (/kiln|clay|pottery/i.test(t))          return 'Kiln';
+      return null;
+    }
+
+    function _entityLabelFor(entityTypeId) {
+      try {
+        const lib = globalThis.gameLibrary?.entities?.[entityTypeId];
+        const libLabel = lib?.name ?? lib?.label ?? null;
+        if (libLabel) return libLabel;
+        return _friendlyEntityLabel(entityTypeId) ?? 'Activity';
+      } catch (_) { return 'Activity'; }
+    }
+
+    // Prettify an item id as a last-resort label when catalog lookup fails.
+    // itm_axe_01 → "Axe", ach_vinegar → "Vinegar", itm_tatoFruit → "Tato Fruit"
+    function _prettifyItemId(itemId) {
+      if (!itemId) return null;
+      const raw = String(itemId)
+        .replace(/^(?:itm_|ach_)/i, '')  // strip prefix
+        .replace(/_(\d+)$/, '')           // strip _01 etc
+        .replace(/_/g, ' ');              // underscores to spaces
+      const words = raw.replace(/([a-z])([A-Z])/g, '$1 $2').split(/\s+/).filter(Boolean);
+      const clean = words.filter(w => !/^\d+$/.test(w));
+      return (clean.length > 0 ? clean : words)
+        .map(w => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
+        .join(' ') || null;
+    }
+
+    // Case-insensitive catalog lookup with extended fallbacks.
+    // Returns null (not a prettified string) — callers decide whether to prettify.
+    function _catalogName(itemId) {
+      if (!itemId || typeof itemId !== 'string') return null;
+      const keys = Object.keys(_itemIdToName);
+      if (keys.length === 0) return null; // catalog not loaded yet
+      // 1. Exact
+      if (_itemIdToName[itemId] !== undefined) return _itemIdToName[itemId];
+      // 2. Case-insensitive
+      const lower = itemId.toLowerCase();
+      for (const k of keys) {
+        if (k.toLowerCase() === lower) return _itemIdToName[k];
+      }
+      // 3. Try with itm_ prefix if not already prefixed
+      if (!lower.startsWith('itm_')) {
+        const withPrefix = 'itm_' + itemId;
+        if (_itemIdToName[withPrefix] !== undefined) return _itemIdToName[withPrefix];
+        const withPrefixLower = 'itm_' + lower;
+        for (const k of keys) {
+          if (k.toLowerCase() === withPrefixLower) return _itemIdToName[k];
+        }
+      }
+      // 4. Strip numeric suffix (e.g. _01) and retry
+      const stripped = itemId.replace(/_\d+$/, '');
+      if (stripped !== itemId) {
+        const fromStripped = _catalogName(stripped);
+        if (fromStripped) return fromStripped;
+      }
+      return null;
+    }
+
+    // Resolve a crop label from fruitItem/seedItem ids.
+    // Never returns "Crop" when either id exists — uses prettify as final fallback.
+    function _resolveCropLabel(fruitItem, seedItem) {
+      if (fruitItem) {
+        const cat = _catalogName(fruitItem);
+        if (cat) return cat.replace(/\s+fruit$/i, '').trim() || cat;
+        const pretty = _prettifyItemId(fruitItem);
+        if (pretty) {
+          if (!_loggedCatalogMisses.has(fruitItem)) {
+            _loggedCatalogMisses.add(fruitItem);
+            console.log(`[timers] catalog miss ${fruitItem} (pretty: ${pretty})`);
+          }
+          return pretty.replace(/\s+fruit$/i, '').trim() || pretty;
+        }
+      }
+      if (seedItem) {
+        const cat = _catalogName(seedItem);
+        if (cat) return cat.replace(/\s+seeds?$/i, '').trim() || cat;
+        const pretty = _prettifyItemId(seedItem);
+        if (pretty) {
+          if (!_loggedCatalogMisses.has(seedItem)) {
+            _loggedCatalogMisses.add(seedItem);
+            console.log(`[timers] catalog miss ${seedItem} (pretty: ${pretty})`);
+          }
+          return pretty.replace(/\s+seeds?$/i, '').trim() || pretty;
+        }
+      }
+      return 'Crop';
+    }
+
+    // Convert an item ID to a crop-friendly display name (used by _pollEntityForTimer).
+    function _itemIdToLabel(itemId) {
+      if (!itemId || typeof itemId !== 'string') return null;
+      const fromMap = _itemIdToName[itemId];
+      if (fromMap) {
+        return fromMap.replace(/\s+(?:seeds?|plant|sprout)$/i, '').trim() || fromMap;
+      }
+      return _prettifyItemId(itemId);
+    }
+
+    function _itemLabelFor(generic, entityTypeId) {
+      try {
+        const di = generic?.displayInfo;
+        if (di?.title && typeof di.title === 'string' && di.title.trim()
+            && !/^(?:ent_|itm_)/i.test(di.title.trim())) return di.title.trim();
+        if (di?.name  && typeof di.name  === 'string' && di.name.trim()
+            && !/^(?:ent_|itm_)/i.test(di.name.trim()))  return di.name.trim();
+
+        // generic.current may be an item id ("itm_popberrySeeds") — resolve it
+        if (typeof generic?.current === 'string' && generic.current.length > 0) {
+          const fromId = _itemIdToLabel(generic.current);
+          if (fromId) return fromId;
+          // Don't fall through to return the raw id — use entity label instead
+        }
+
+        // generic.state may encode the crop: "growing_popberry" → "Popberry"
+        if (typeof generic?.state === 'string') {
+          const m = generic.state.match(/^(?:growing|planted|crafting)_(.+)$/i);
+          if (m) {
+            const word = m[1];
+            return word.charAt(0).toUpperCase() + word.slice(1).toLowerCase();
+          }
+        }
+
+        return _entityLabelFor(entityTypeId);
+      } catch (_) { return 'Activity'; }
+    }
+
+    function _landLabelFor(mapId) {
+      if (!mapId) return 'your land';
+      const s = String(mapId);
+      // nftHouse486 / nftHouse_486 → "House 486"
+      const houseM = s.match(/nfthouse[_-]?(\d+)/i);
+      if (houseM) return `House ${houseM[1]}`;
+      // farmLand486 / nftFarm486 / nftLand486 / pixelsNFTFarm-486 → "Land 486"
+      const farmM = s.match(/(?:farmland|nftfarm|nftland|land|pixelsnftfarm)[_-]?(\d+)/i);
+      if (farmM) return `Land ${farmM[1]}`;
+      // speck → "Speck"
+      if (/speck/i.test(s)) return 'Speck';
+      // bare number → "Land <n>"
+      if (/^\d+$/.test(s)) return `Land ${s}`;
+      return s;
+    }
+
+    function _syncTimers() {
+      try {
+        const arr = [..._actTimers.values()];
+        saveToCompanion('activityTimers', { timers: arr });
+        console.log(`[timers] stored: ${arr.length} timer(s) — ` + arr.map(t => t.itemLabel).join(', '));
+      } catch (e) { console.error('[timers] error in _syncTimers:', e); }
+    }
+
+    // Re-label existing timers after catalog loads — crop timers are re-labeled on next scan
+    // tick naturally; craft timers need explicit relabeling using stored _achId.
+    function _relabelTimers() {
+      let changed = false;
+      for (const [key, timer] of _actTimers) {
+        if (timer.source === 'craft' && timer._achId) {
+          const newItem = _catalogName('itm_' + timer._achId) ?? _catalogName(timer._achId);
+          if (newItem) {
+            const parts = timer.itemLabel.split(' · ');
+            const newLabel = parts[0] + ' · ' + newItem;
+            if (newLabel !== timer.itemLabel) {
+              timer.itemLabel = newLabel;
+              changed = true;
+              console.log(`[timers] relabeled craft: ${newLabel}`);
+            }
+          }
+        }
+      }
+      if (changed) _syncTimers();
+    }
+
+    // Actions that are never crafting/planting/mining — suppress from timer logging.
+    const _TIMER_IGNORE = new Set([
+      'mv', 'move', 'timerCheck', 'ping', 'pong', 'updateCamera',
+      'camera', 'chat', 'emote', 'expression',
+    ]);
+
+    // Poll room.state.entities every 500ms (up to 10×) until the entity has a
+    // valid future utcRefresh — the game pushes the update asynchronously.
+    // Dumps entity state once per typeId so field names are visible in console.
+    function _pollEntityForTimer(midStr) {
+      let attempts   = 0;
+      let dumped     = false;      // full state dump fired for this poll
+      const maxTries = 10;
+      const clickedAt = Date.now(); // capture when the action was first seen
+
+      // Snapshot inventory NOW (before game processes the action) for seed-drop and
+      // ingredient-consumption detection. 2 s later we diff results.
+      const mapId0     = getScene()?.stateManager?.mapId ?? 'unknown';
+      const plotKey    = mapId0 + ':' + midStr;
+      const selfSnap0  = getScene()?.stateManager?.selfPlayer;
+      const invBefore  = {};
+      selfSnap0?.inventory?.slots?.$items?.forEach(slot => {
+        if (slot?.item == null) return;
+        const id = String(slot.item?.id ?? slot.item ?? '');
+        if (id.startsWith('itm_'))
+          invBefore[id] = (invBefore[id] ?? 0) + (slot.quantity ?? 0);
+      });
+
+      setTimeout(() => {
+        try {
+          const selfAfter = getScene()?.stateManager?.selfPlayer;
+          if (!selfAfter) return;
+          const invAfter = {};
+          selfAfter?.inventory?.slots?.$items?.forEach(slot => {
+            if (slot?.item == null) return;
+            const id = String(slot.item?.id ?? slot.item ?? '');
+            if (id.startsWith('itm_'))
+              invAfter[id] = (invAfter[id] ?? 0) + (slot.quantity ?? 0);
+          });
+          let anyConsumed = false;
+          for (const [id, before] of Object.entries(invBefore)) {
+            const after = invAfter[id] ?? 0;
+            if (before > after) {
+              anyConsumed = true;
+              if (/seeds?/i.test(id)) {
+                _plotSeeds[plotKey] = id;
+                console.log(`[timers] plot seed detected: ${plotKey} → ${id}`);
+                _savePlotSeeds();
+              }
+            }
+          }
+          if (anyConsumed) {
+            _lastIngredientActionAt = Date.now();
+          }
+        } catch (_) {}
+      }, 2000);
+
+      const poll = setInterval(() => {
+        attempts++;
+        try {
+          const room = getScene()?.stateManager?.room;
+          if (!room?.state?.entities) {
+            if (attempts >= maxTries) {
+              clearInterval(poll);
+              console.log(`[timers] not started: no room.state.entities after ${maxTries} tries (mid=${midStr})`);
+            }
+            return;
+          }
+
+          let found   = null;
+          let foundVia = 'key';
+          // Key lookup first (O(1)); Colyseus MapSchema key may or may not equal entity.mid.
+          if (typeof room.state.entities.get === 'function') {
+            const byKey = room.state.entities.get(midStr);
+            if (byKey) found = byKey;
+          }
+          if (!found) {
+            foundVia = 'mid/id';
+            room.state.entities.forEach((e) => {
+              if (!found && (String(e?.mid) === midStr || String(e?.id) === midStr)) found = e;
+            });
+          }
+
+          if (!found) {
+            if (attempts >= maxTries) {
+              clearInterval(poll);
+              console.log(`[timers] not started: entity ${midStr} not found in room.state after ${maxTries} tries`);
+            }
+            return;
+          }
+
+          const generic = found.generic;
+
+          // Dump once per new entity typeId (debug only; skip allcrops — shape already known).
+          if (window.PX_COMPANION_DEBUG && !dumped && !_dumpedEntityTypes.has(found.entity)) {
+            dumped = true;
+            _dumpedEntityTypes.add(found.entity);
+            if (!/allcrops|crop|plot|farm/i.test(found.entity)) {
+              try {
+                console.log(`[timers] entity generic dump (type=${found.entity}):`, JSON.stringify(found.generic));
+              } catch(_) {}
+            }
+          }
+
+          // Accept utcRefresh first, then displayInfo.utcTarget, then statics.minutesNeeded.
+          const statics    = generic?.statics;
+          const minutesNeeded = _staticsGet(statics, 'minutesNeeded');
+          const minutesFbk = minutesNeeded
+            ? (clickedAt + Number(minutesNeeded) * 60_000) : null;
+          const utcRefresh = generic?.utcRefresh || generic?.displayInfo?.utcTarget
+            || minutesFbk || null;
+
+          if (!utcRefresh || utcRefresh <= Date.now()) {
+            // Entity is idle/done — if we had a tracked timer for this mid, it was collected.
+            if (_actTimers.has(midStr)) {
+              const old = _actTimers.get(midStr);
+              _actTimers.delete(midStr);
+              _notifiedTimerIds.delete(midStr);
+              console.log(`[timers] collected (entity idle on poll): ${old.itemLabel} on ${old.landLabel}`);
+              _syncTimers();
+            }
+            if (attempts >= maxTries) {
+              clearInterval(poll);
+              // Batch "empty/idle plot" logs instead of one line per click
+              _emptyPlotBatchCount++;
+              _logEmptyPlotBatch();
+            }
+            return;
+          }
+
+          clearInterval(poll);
+
+          const existing = _actTimers.get(midStr);
+          if (existing && existing.readyAt === utcRefresh) return; // same timer already tracked
+
+          const mapId       = getScene()?.stateManager?.mapId ?? 'unknown';
+          const entityLabel = _entityLabelFor(found.entity);
+          const pKey        = mapId + ':' + midStr;
+          const fruitItem   = _staticsGet(statics, 'fruitItem') ?? null;
+          const seedItemId  = _staticsGet(statics, 'seedItem') ?? _plotSeeds[pKey] ?? null;
+          const itemLabel   = _resolveCropLabel(fruitItem, seedItemId);
+          const landLabel   = _landLabelFor(mapId);
+          const timer = {
+            entityMid: midStr, entityLabel, source: 'crop', itemLabel, landLabel,
+            mapId: String(mapId), startedAt: Date.now(), readyAt: utcRefresh,
+          };
+          _actTimers.set(midStr, timer);
+          _notifiedTimerIds.delete(midStr);
+          console.log(`[timers] started: ${itemLabel} on ${landLabel}, ready at ${new Date(utcRefresh).toISOString()}`);
+          _syncTimers();
+
+        } catch (e) {
+          console.error('[timers] error in poll:', e);
+          if (attempts >= maxTries) clearInterval(poll);
+        }
+      }, 500);
     }
 
     // ---- Panel cache — in-memory mirror + storage bridge --------------------
@@ -805,6 +1464,17 @@
           'from', Object.keys(rawI18n).length, 'raw keys');
         const samples = Object.entries(reverse).slice(0, 3).map(([n, id]) => `"${n}"→${id}`).join(', ');
         console.log(TAG, '[market] _fetchLibItems: name→id samples:', samples);
+
+        // Build direct itemId → display name map for timer labels
+        const idToName = {};
+        for (const [k, displayName] of Object.entries(rawI18n)) {
+          if (typeof displayName !== 'string') continue;
+          if (!k.endsWith('_name')) continue;
+          const id = k.slice(0, -5);
+          if (id.startsWith('itm_') && !idToName[id]) idToName[id] = displayName;
+        }
+        _itemIdToName = idToName;
+        console.log(`[timers] catalog size=${Object.keys(idToName).length}`);
       }
 
       return _libItems;
@@ -867,6 +1537,12 @@
     // a per-listing array with purchasedQty + createdAt for server-side demand tracking.
     // No ownerId or ownerUsername is retained.
     async function _fetchMpPriceFull(itemId, pid) {
+      // Global 429 backoff — stop all market fetches until the backoff window expires.
+      if (_marketBackoffUntil > Date.now()) {
+        console.log(TAG, '[market] _fetchMpPriceFull: skipped (429 backoff until',
+          new Date(_marketBackoffUntil).toISOString() + ')');
+        return null;
+      }
       const now    = Date.now();
       const cached = _mpCache[itemId];
       if (cached && (now - cached.fetchedAt) < _MP_TTL) {
@@ -885,7 +1561,13 @@
       try {
         const res = await _origFetch(url, { headers: hdrs });
         console.log(TAG, '[market] _fetchMpPriceFull:', itemId, 'status=' + res.status);
-        if (!res.ok) return null;
+        if (!res.ok) {
+          if (res.status === 429) {
+            _marketBackoffUntil = Date.now() + _MARKET_BACKOFF_MS;
+            console.log(TAG, '[market] 429 received — halting all market fetches for 5 min');
+          }
+          return null;
+        }
         const body = await res.json();
 
         const parsed = _parseMarketBody(body);
@@ -930,6 +1612,17 @@
     let _pricesRefreshedForCapturedAt = 0;
 
     async function _refreshTaskboardPrices(calledFrom) {
+      // Mutex: only one refresh running at a time.
+      if (_refreshPricesRunning) {
+        console.log(TAG, '[market] _refreshTaskboardPrices skip — already running (from:', calledFrom + ')');
+        return;
+      }
+      // Min-gap: at least 60 s between runs.
+      const sinceLastRun = Date.now() - _refreshPricesLastRan;
+      if (_refreshPricesLastRan > 0 && sinceLastRun < _REFRESH_PRICES_MIN_GAP_MS) {
+        console.log(TAG, '[market] _refreshTaskboardPrices skip — too soon (' + Math.round(sinceLastRun / 1000) + 's since last run, min=' + (_REFRESH_PRICES_MIN_GAP_MS / 1000) + 's)');
+        return;
+      }
       const items = ctx.taskboard;
       const pid   = ctx.playerId;
       console.log(TAG, '[market] _refreshTaskboardPrices triggered from:', calledFrom,
@@ -944,34 +1637,47 @@
         return;
       }
 
-      const names = [...new Set(items.map(i => i.itemName))];
-      console.log(TAG, '[market] item names to resolve (' + names.length + '):', names.join(', '));
+      _refreshPricesRunning = true;
+      try {
+        const names = [...new Set(items.map(i => i.itemName))];
+        console.log(TAG, '[market] item names to resolve (' + names.length + '):', names.join(', '));
 
-      const lib = await _fetchLibItems();
-      console.log(TAG, '[market] lib available:', !!lib, lib ? Object.keys(lib).length + ' entries' : '');
+        const lib = await _fetchLibItems();
+        console.log(TAG, '[market] lib available:', !!lib, lib ? Object.keys(lib).length + ' entries' : '');
 
-      await Promise.all(names.map(async name => {
-        const itemId = _findItemId(name);
-        if (!itemId) {
-          console.log(TAG, '[market] name→id: "' + name + '" → NO MATCH');
-          return;
+        // Sequential with ~1.5 s gap to avoid bursting the marketplace endpoint.
+        for (const name of names) {
+          if (_marketBackoffUntil > Date.now()) {
+            console.log(TAG, '[market] _refreshTaskboardPrices: aborting mid-run due to 429 backoff');
+            break;
+          }
+          const itemId = _findItemId(name);
+          if (!itemId) {
+            console.log(TAG, '[market] name→id: "' + name + '" → NO MATCH');
+            continue;
+          }
+          console.log(TAG, '[market] name→id: "' + name + '" → ' + itemId);
+          // Enrich matching taskboard items with their resolved itemId so the backend
+          // can look them up in the player's inventory and storage chests.
+          items.forEach(item => { if (item.itemName === name && !item.itemId) item.itemId = itemId; });
+          const listing = await _fetchMpPriceFull(itemId, pid);
+          if (listing) {
+            ctx.marketPrices[itemId] = { lowestPrice: listing.lowestPrice, quantity: listing.quantity };
+            console.log(TAG, '[market] price stored: "' + name + '" (' + itemId + ') lowestPrice=' + listing.lowestPrice + ' qty=' + listing.quantity);
+            _postPriceToBackend(itemId, listing.lowestPrice, listing.avgPrice, listing.volume, listing.listings);
+          } else {
+            console.log(TAG, '[market] price fetch returned null for "' + name + '" (' + itemId + ')');
+          }
+          // ~1.5 s gap between sequential requests.
+          await new Promise(r => setTimeout(r, 1500));
         }
-        console.log(TAG, '[market] name→id: "' + name + '" → ' + itemId);
-        // Enrich matching taskboard items with their resolved itemId so the backend
-        // can look them up in the player's inventory and storage chests.
-        items.forEach(item => { if (item.itemName === name && !item.itemId) item.itemId = itemId; });
-        const listing = await _fetchMpPriceFull(itemId, pid);
-        if (listing) {
-          ctx.marketPrices[itemId] = { lowestPrice: listing.lowestPrice, quantity: listing.quantity };
-          console.log(TAG, '[market] price stored: "' + name + '" (' + itemId + ') lowestPrice=' + listing.lowestPrice + ' qty=' + listing.quantity);
-          _postPriceToBackend(itemId, listing.lowestPrice, listing.avgPrice, listing.volume, listing.listings);
-        } else {
-          console.log(TAG, '[market] price fetch returned null for "' + name + '" (' + itemId + ')');
-        }
-      }));
 
-      _pricesRefreshedForCapturedAt = capturedAt;
-      console.log(TAG, '[market] done. marketPrices keys:', Object.keys(ctx.marketPrices));
+        _pricesRefreshedForCapturedAt = capturedAt;
+        _refreshPricesLastRan = Date.now();
+        console.log(TAG, '[market] done. marketPrices keys:', Object.keys(ctx.marketPrices));
+      } finally {
+        _refreshPricesRunning = false;
+      }
     }
 
     // ---- Background market price collector ------------------------------------
@@ -996,6 +1702,13 @@
     const _COLLECTOR_PAUSE_AFTER = 3;      // pause after this many consecutive failures
     const _STAPLE_RECHECK_MS    = 2 * 60 * 60 * 1000;  // re-check staples every 2 h
     let _stapleIds              = [];      // item IDs marked isStaple by priority-items
+
+    // Rate-limit state: shared by taskboard refresh and collector.
+    let _marketBackoffUntil      = 0;           // all market fetches halted until this timestamp
+    let _refreshPricesRunning    = false;        // mutex: only one _refreshTaskboardPrices at a time
+    let _refreshPricesLastRan    = 0;            // timestamp of last completed run
+    const _REFRESH_PRICES_MIN_GAP_MS = 60_000;  // minimum 60 s between taskboard refreshes
+    const _MARKET_BACKOFF_MS         = 5 * 60_000; // 5 min halt on any 429
 
     async function _loadPriorityQueue() {
       try {
@@ -1051,6 +1764,10 @@
 
     function _processNextCollectorItem() {
       if (_collectorInFlight || _collectorPaused) return;
+      if (_marketBackoffUntil > Date.now()) {
+        console.log(TAG, '[market] collector: skipping tick (429 backoff)');
+        return;
+      }
 
       if (_collectorQueue.length === 0 || _sessionFetchCount >= _MAX_SESSION_FETCHES) {
         clearInterval(_collectorTimer);
@@ -1124,22 +1841,54 @@
 
     // Listen for cache data posted back by content.js (requestPanelCache reply).
     window.addEventListener('message', event => {
-      if (event.source !== window) return;
-      if (!event.data || event.data.source !== 'pixels-companion-host') return;
-      if (event.data.category === 'panelCache') {
-        const d = event.data.data ?? {};
-        if (d.taskboard) _taskboardCache = d.taskboard;
-        if (d.stacked)   _stackedCache   = d.stacked;
-        if (d.chestCaches && typeof d.chestCaches === 'object') {
-          for (const [mid, entry] of Object.entries(d.chestCaches)) {
-            _chestCache[mid] = entry;
+      try {
+        if (event.source !== window) return;
+        if (!event.data || event.data.source !== 'pixels-companion-host') return;
+        if (event.data.category === 'panelCache') {
+          const d = event.data.data ?? {};
+          if (d.taskboard) _taskboardCache = d.taskboard;
+          if (d.stacked)   _stackedCache   = d.stacked;
+          if (d.chestCaches && typeof d.chestCaches === 'object') {
+            for (const [mid, entry] of Object.entries(d.chestCaches)) {
+              _chestCache[mid] = entry;
+            }
+            if (Object.keys(d.chestCaches).length > 0) {
+              ctx.storageChests = { ..._chestCache };
+              console.log(TAG, '[storage] loaded chest caches:', Object.keys(d.chestCaches));
+            }
           }
-          if (Object.keys(d.chestCaches).length > 0) {
-            ctx.storageChests = { ..._chestCache };
-            console.log(TAG, '[storage] loaded chest caches:', Object.keys(d.chestCaches));
+          // Restore plot→seed map
+          if (d.plotSeeds && typeof d.plotSeeds === 'object') {
+            Object.assign(_plotSeeds, d.plotSeeds);
+            console.log('[timers] plot seeds restored:', Object.keys(_plotSeeds).length);
           }
+          // Restore stored activity timers; notify about any that finished while away
+          try {
+            if (Array.isArray(d.activityTimers)) {
+              const now = Date.now();
+              const pastDue = [];
+              for (const t of d.activityTimers) {
+                if (!t?.entityMid) continue;
+                _actTimers.set(String(t.entityMid), t);
+                if (t.readyAt <= now) pastDue.push(t);
+              }
+              if (pastDue.length > 0) {
+                const byLand = {};
+                for (const t of pastDue) {
+                  (byLand[t.landLabel] ??= []).push(t.itemLabel);
+                }
+                const parts = Object.entries(byLand)
+                  .map(([land, items]) => `on ${land}: ${items.join(', ')}`)
+                  .join('; ');
+                saveToCompanion('companionEvent', {
+                  type: 'awayTimers',
+                  message: `While you were away, your timers completed — please collect: ${parts}.`,
+                });
+              }
+            }
+          } catch (e) { console.error('[timers] error loading stored timers:', e); }
         }
-      }
+      } catch (_) {}
     });
 
     // Best-effort search for the taskboard board-reset countdown.
@@ -1208,9 +1957,11 @@
 
     // Push a snapshot whenever player position is known (not just when energy loads).
     setInterval(() => {
-      if (ctx.energy !== null || Object.keys(ctx.skills).length > 0 || ctx.playerX !== null) {
-        saveToCompanion('playerContext', { ...ctx });
-      }
+      try {
+        if (ctx.energy !== null || Object.keys(ctx.skills).length > 0 || ctx.playerX !== null) {
+          saveToCompanion('playerContext', { ...ctx });
+        }
+      } catch (_) {}
     }, 200);
 
     // ---- Player energy -------------------------------------------------------
@@ -1508,6 +2259,11 @@
           if (!_loggedRooms.has(_sessionId)) {
             _loggedRooms.add(_sessionId);
             _logRoomDiagnostic(_room, _sessionId);
+            // Unlock land report for this mapId only after the new room is confirmed.
+            _landReportAllowedMapId = getScene()?.stateManager?.mapId ?? null;
+            console.log('[land-report] NEW ROOM confirmed, unlocked for mapId=' + _landReportAllowedMapId);
+            // Scan statics on new room so crop timers appear immediately on warp.
+            setTimeout(_scanStaticsCraftTimers, 500);
           }
         }
 
@@ -2122,6 +2878,7 @@
 
         handleStateUpdate('recipe viewed', recipe);
         saveToCompanion('recipe', recipe);
+        _lastViewedRecipe = recipe;
         lastCraftingKey = diffKey;
       } catch (_) {}
     }, 200);
@@ -2142,16 +2899,17 @@
       } catch (_) {}
     }, 200);
 
-    // ---- room.send wrapper — one-shot setup ---------------------------------
-    // stateManager.room is established asynchronously after game init, so we
-    // poll for it rather than reading at startPolling time.  Once found, we
-    // wrap it once and clear the interval so no further overhead is incurred.
-    let roomWrapped = false;
-    const roomDetectInterval = setInterval(() => {
+    // ---- room.send wrapper — re-wraps on every new room ----------------------
+    // stateManager.room is established asynchronously after game init and
+    // changes after each warp.  We keep the interval running and re-wrap
+    // whenever the room object changes.
+    let _wrappedRoom = null;
+    setInterval(() => {
       try {
         const room = getScene()?.stateManager?.room;
-        if (!room || roomWrapped) return;
-        roomWrapped = true;
+        if (!room || room === _wrappedRoom) return;
+        _wrappedRoom = room;
+        const mapId = getScene()?.stateManager?.mapId ?? 'unknown';
 
         // Wrap outgoing sends; callback fires on storage-open actions.
         wrapRoomSend(room, getScene, (action, mid, params) => {
@@ -2162,16 +2920,116 @@
             console.log(TAG, '[room][storage] storage action (no mid found)', { action, params });
           }
         });
-        console.log(TAG, 'room.send wrapped — action detection active.');
+        console.log(TAG, `room.send wrapped for ${mapId} — action detection active.`);
+
+        // Timer detection — second wrapper logs qualifying actions and starts a poll.
+        try {
+          const _timerWrappedSend = room.send;
+          room.send = function (...args) {
+            try {
+              const act       = typeof args[0] === 'string' ? args[0] : '';
+              const capturing = Date.now() < _craftCaptureUntil;
+              if (capturing && window.PX_COMPANION_DEBUG) {
+                console.log(`[timers] CAPTURE send: ${act}`, JSON.stringify(args[1] ?? null).slice(0, 300));
+              }
+              if (!_TIMER_IGNORE.has(act)) {
+                const p   = (args[1] != null && typeof args[1] === 'object') ? args[1] : {};
+                const mid = p.mid ?? p.entityMid ?? p.entity ?? p.id ?? null;
+                // Track entity type for station label lookups by presentUI handler
+                if (mid != null && typeof p.entity === 'string') {
+                  _lastClickEntityInfo.set(String(mid), { typeId: String(p.entity), ts: Date.now() });
+                }
+                if (!capturing && window.PX_COMPANION_DEBUG) console.log(`[timers] action seen: ${act} ${mid != null ? String(mid) : 'none'}`);
+                if (mid != null) {
+                  _craftCaptureUntil = Date.now() + 15_000;
+                  _pollEntityForTimer(String(mid));
+                }
+              }
+            } catch (e) { console.error('[timers] error in send wrapper:', e); }
+            return _timerWrappedSend.apply(this, args);
+          };
+        } catch (e) { console.error('[timers] error setting up send wrapper:', e); }
 
         // Hook incoming messages for diagnostics and storage detection.
         if (typeof room.onMessage === 'function') {
           try {
             room.onMessage('*', (type, message) => {
-              const _typeStr = String(type);
-              // Fast exit for non-storage types — keeps updatePlayer/high-frequency
-              // messages near-zero cost (no JSON.stringify, no regex).
-              if (!/storage|chest|container|slot/i.test(_typeStr)) return;
+              const _typeStr   = String(type);
+              const _capturing = Date.now() < _craftCaptureUntil;
+              if (_capturing && window.PX_COMPANION_DEBUG) {
+                console.log(`[timers] msg ${_typeStr} ${JSON.stringify(message).slice(0, 300)}`);
+              }
+
+              // presentUI: craft station signal
+              if (_typeStr === 'presentUI' && message && typeof message.ui === 'string'
+                  && message.ui.startsWith('craft:')) {
+                try {
+                  const params   = Array.isArray(message.params) ? message.params : [];
+                  const state    = String(params[1] ?? '');
+                  const source   = String(message.source ?? '');
+                  const mapId    = String(getScene()?.stateManager?.mapId ?? 'unknown');
+                  const timerKey = mapId + ':' + source;
+                  const now      = Date.now();
+
+                  if (state === 'update:crafting' || state === 'update:busy') {
+                    const finishMs = typeof params[3] === 'number' ? params[3] : null;
+                    if (finishMs && finishMs > now) {
+                      const skillRaw   = message.ui.slice('craft:'.length);
+                      const skillLabel = skillRaw.charAt(0).toUpperCase() + skillRaw.slice(1);
+                      const achRaw     = String(params[2] ?? '').replace(/^ach_/i, '');
+                      const itemName   = achRaw
+                        ? (_catalogName('itm_' + achRaw) ?? _catalogName(achRaw) ?? _prettifyItemId(achRaw))
+                        : null;
+                      if (achRaw && !itemName && !_loggedCatalogMisses.has(achRaw)) {
+                        _loggedCatalogMisses.add(achRaw);
+                        console.log(`[timers] catalog miss ${achRaw}`);
+                      }
+                      const existing      = _actTimers.get(timerKey);
+                      const existingAch   = existing?._achId ?? null;
+                      const existingItem  = existing?.itemLabel?.includes(' · ')
+                        ? existing.itemLabel.split(' · ').slice(1).join(' · ') : null;
+                      const resolvedItem  = itemName || existingItem || null;
+                      const resolvedAch   = achRaw || existingAch || null;
+                      const typeInfo      = source ? _lastClickEntityInfo.get(source) : null;
+                      const stationType   = (typeInfo ? _friendlyEntityLabel(typeInfo.typeId) : null) ?? skillLabel;
+                      const itemLabel     = resolvedItem ? `${stationType} · ${resolvedItem}` : stationType;
+                      const landLabel     = _landLabelFor(mapId);
+                      _actTimers.set(timerKey, {
+                        entityMid: source, entityLabel: 'craft', source: 'craft',
+                        itemLabel, landLabel, mapId, startedAt: now, readyAt: finishMs,
+                        _achId: resolvedAch,
+                      });
+                      _notifiedTimerIds.delete(timerKey);
+                      console.log(`[timers] craft: ${itemLabel} on ${landLabel}, ready at ${new Date(finishMs).toISOString()}`);
+                      _syncTimers();
+                    }
+                  } else if (state === 'update:ready') {
+                    const existing = _actTimers.get(timerKey);
+                    if (existing) {
+                      existing.readyAt = Math.min(existing.readyAt, now - 1);
+                      _syncTimers();
+                      console.log(`[timers] craft ready: ${existing.itemLabel}`);
+                    }
+                  } else if (state === 'available') {
+                    const existing = _actTimers.get(timerKey);
+                    if (existing && existing.readyAt <= now) {
+                      _actTimers.delete(timerKey);
+                      _notifiedTimerIds.delete(timerKey);
+                      console.log(`[timers] craft collected (available): ${existing.itemLabel}`);
+                      _syncTimers();
+                    }
+                  } else {
+                    if (!_knownPresentUIStates.has(state)) {
+                      _knownPresentUIStates.add(state);
+                      console.log(`[timers] presentUI state: ${state}`);
+                    }
+                  }
+                } catch (e) { console.error('[timers] presentUI error:', e); }
+                return;
+              }
+
+              // Fast exit for non-storage types outside capture window.
+              if (!_capturing && !/storage|chest|container|slot/i.test(_typeStr)) return;
               // Log each storage-related type exactly once.
               if (!_loggedMsgTypes.has(_typeStr)) {
                 _loggedMsgTypes.add(_typeStr);
@@ -2195,10 +3053,57 @@
             console.log(TAG, '[room] onMessage hook failed:', e);
           }
         }
-
-        clearInterval(roomDetectInterval);
       } catch (_) {}
     }, 200);
+
+    // ---- Activity timer check — 5 s interval --------------------------------
+    setInterval(() => {
+      try {
+        const now  = Date.now();
+        const room = getScene()?.stateManager?.room;
+        let changed = false;
+        for (const [mid, timer] of _actTimers) {
+          // Collection check: entity is back to idle/no utcRefresh after readyAt
+          if (room?.state?.entities && timer.readyAt <= now) {
+            let found = null;
+            room.state.entities.forEach((e) => { if (String(e?.mid) === mid) found = e; });
+            if (found) {
+              const utcRefresh = found.generic?.utcRefresh;
+              if (!utcRefresh || utcRefresh <= 0) {
+                _actTimers.delete(mid);
+                _notifiedTimerIds.delete(mid);
+                console.log(`[timers] collected: ${timer.itemLabel} on ${timer.landLabel}`);
+                changed = true;
+                continue;
+              }
+            }
+          }
+          // Notify once when timer completes
+          if (timer.readyAt <= now && !_notifiedTimerIds.has(mid)) {
+            _notifiedTimerIds.add(mid);
+            try {
+              const verb = timer.itemLabel.match(/s$/i) ? 'are' : 'is';
+              saveToCompanion('companionEvent', {
+                type: 'timerReady',
+                message: `Your ${timer.itemLabel} ${verb} ready on ${timer.landLabel}.`,
+              });
+            } catch (_) {}
+          }
+        }
+        if (changed) _syncTimers();
+      } catch (e) { console.error('[timers] error:', e); }
+    }, 5000);
+
+    // ---- Catalog early load — ensures timer labels are ready from the start ----
+    setTimeout(() => {
+      _fetchLibItems().then(() => {
+        const n = Object.keys(_itemIdToName).length;
+        if (n > 0) _relabelTimers();
+      }).catch(() => {});
+    }, 5_000);
+
+    // ---- Statics craft timer scan — 10 s interval ----------------------------
+    setInterval(_scanStaticsCraftTimers, 10_000);
 
     // ---- Storage slot polling — 2 s interval --------------------------------
     // Polls room.state.storage for changes; caches chest contents by mid when
@@ -2248,12 +3153,8 @@
       } catch (_) {}
     }, 2000);
 
-    // ---- Texture census — one-shot, fires 5 s after game capture -----------
-    // Enough time for the gameplay scene's preload() to finish loading assets.
-    // Logs every texture matching /player|avatar|char|sprite|npc/i with full
-    // sheet dimensions, per-frame dimensions, and frame count.
-    // Also logs the complete key list so the regex can be tuned if nothing hits.
-    setTimeout(() => {
+    // ---- Texture census — debug-only, one-shot, fires 5 s after game capture --
+    if (window.PX_COMPANION_DEBUG) setTimeout(() => {
       try {
         const textures = game.textures;
         if (!textures) {
@@ -2261,7 +3162,7 @@
           return;
         }
 
-        const allKeys = textures.getTextureKeys(); // excludes __DEFAULT, __MISSING
+        const allKeys = textures.getTextureKeys();
         const matches = allKeys.filter(k => /player|avatar|char|sprite|npc/i.test(k));
 
         console.log(TAG, `texture census: ${allKeys.length} textures loaded, ${matches.length} regex matches`);
@@ -2273,8 +3174,6 @@
           const sheetW = src?.width  ?? '?';
           const sheetH = src?.height ?? '?';
 
-          // getFrameNames(false) excludes the __BASE sentinel so we get only
-          // real animation/atlas frames.
           const frameNames = tex.getFrameNames(false);
           const frameCount = frameNames.length;
 
@@ -2284,7 +3183,6 @@
             frameW = f?.realWidth  ?? f?.width  ?? '?';
             frameH = f?.realHeight ?? f?.height ?? '?';
           } else {
-            // Plain image with no atlas — whole sheet is the single frame.
             const base = tex.get('__BASE');
             frameW = base?.realWidth  ?? sheetW;
             frameH = base?.realHeight ?? sheetH;
@@ -2303,37 +3201,82 @@
       }
     }, 5000);
     // ---- Land industry state — diff-on-change, 1 s interval -----------------
-    // Waits for room.state.entities to exist, then reads industry entities on
-    // every tick.  Saves to storage only when the snapshot content changes —
-    // utcRefresh is part of the diff key, so a finishing entity IS a real change.
-    // Logs a compact summary on every save so progress is visible in DevTools.
-    let lastLandSnapshotKey = null;
+    // Fires on the first tick that entities are ready (catches page-load-on-land),
+    // then on every change.  Logs [land-report] at each decision point so Lizzy
+    // can filter the DevTools console to "land-report" and see exactly what happens.
+    let lastLandSnapshotKey      = null;
+    let landSnapshotSkipNote     = '';   // tracks last skip reason to avoid log spam
+    let _landReportAllowedMapId  = null; // set only when NEW ROOM is confirmed
+    let _landCensusLoggedMapId   = null; // track which mapId had its census logged
 
     setInterval(() => {
       try {
         const room = getScene()?.stateManager?.room;
-        if (!room?.state?.entities) return;
+        if (!room?.state?.entities) {
+          if (landSnapshotSkipNote !== 'no-entities') {
+            landSnapshotSkipNote = 'no-entities';
+            console.log('[land-report] skipped: room.state.entities not ready yet');
+          }
+          return;
+        }
 
         const mapId = getScene()?.stateManager?.mapId;
-        if (!mapId) return;
+        if (!mapId) {
+          if (landSnapshotSkipNote !== 'no-mapid') {
+            landSnapshotSkipNote = 'no-mapid';
+            console.log('[land-report] skipped: no mapId from stateManager');
+          }
+          return;
+        }
 
-        const industries = readIndustryState(room);
-        if (!industries) return;
+        // Guard: only send report after NEW ROOM has been confirmed for this mapId.
+        if (mapId !== _landReportAllowedMapId) {
+          if (landSnapshotSkipNote !== 'waiting-new-room') {
+            landSnapshotSkipNote = 'waiting-new-room';
+            console.log('[land-report] skipped: waiting for NEW ROOM confirmation for mapId=' + mapId);
+          }
+          return;
+        }
 
+        // Log top-15 entity typeIds once per land visit (debug only).
+        if (window.PX_COMPANION_DEBUG && _landCensusLoggedMapId !== mapId) {
+          _landCensusLoggedMapId = mapId;
+          try {
+            const typeCounts = {};
+            room.state.entities.forEach(e => {
+              const t = String(e?.entity ?? 'unknown');
+              typeCounts[t] = (typeCounts[t] ?? 0) + 1;
+            });
+            const sorted = Object.entries(typeCounts).sort((a, b) => b[1] - a[1]).slice(0, 15);
+            console.log('[land-report] entity census for ' + mapId + ' (top 15):',
+              sorted.map(([t, c]) => t + '×' + c).join(', '));
+          } catch (_) {}
+        }
+
+        landSnapshotSkipNote = '';   // clear once we have valid state
+
+        const industries  = readIndustryState(room) ?? [];
         const permissions = readMapPermissions(room);
-        const snapshot    = shapeLandSnapshot(mapId, industries, permissions);
+        const soilTiers   = readSoilState(room);
+        const snapshot    = shapeLandSnapshot(mapId, industries, permissions, soilTiers);
         const key         = landSnapshotKey(snapshot);
 
-        if (key === lastLandSnapshotKey) return;
+        if (key === lastLandSnapshotKey) return;   // stable — no log to avoid spam
         lastLandSnapshotKey = key;
 
+        console.log(`[land-report] sending: land ${mapId}, ${industries.length} industries`);
         saveToCompanion('landSnapshot', snapshot);
+        const soilTotal = Object.values(soilTiers).reduce((s, n) => s + n, 0);
         handleStateUpdate('land industry snapshot', {
           landId:        snapshot.landId,
           industryCount: snapshot.industries.length,
+          soilCount:     soilTotal,
           observedAt:    snapshot.observedAt,
         });
-      } catch (_) {}
+        console.log(`[land-report] server: snapshot saved for land ${mapId}`);
+      } catch (err) {
+        console.error('[land-report] error in snapshot:', err);
+      }
     }, 1000);
   }
 

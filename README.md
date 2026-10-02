@@ -1,9 +1,21 @@
 # Pixels Dojo Companion
 
-An AI companion for [Pixels Online](https://pixels.xyz) — instant answers, strategy advice, and live context-aware help, right inside the game.
+**v0.2.0** — An AI companion for [Pixels Online](https://pixels.xyz) — instant answers, strategy advice, and live context-aware help, right inside the game.
 
 > **Work in progress — feedback very welcome!**
 > Share thoughts, bugs, or suggestions: [Feedback form](https://docs.google.com/forms/d/e/1FAIpQLScuYiSpElgN98WqsbMMjqa6IkfyNoN3zE3KyJ96RSxrKi0nHw/viewform)
+
+---
+
+## What's new in v0.2.0
+
+- **Activity timers** — crop and crafting countdowns named by item (Stove · Vinegar, Woodwork · Axe, etc.), persistent across map changes
+- **Today's XP** in the Diary: per-skill gains since midnight, level-up markers, Yesterday view
+- **Stop button** — cancel Pixin's answer mid-request (or press Esc)
+- **Goals** fill in skill levels automatically ("reach Stoneshaping \<level>" → "reach Stoneshaping 45")
+- Works alongside other Pixels extensions; lighter on the game's loading
+
+See [CHANGELOG.md](CHANGELOG.md) for full details.
 
 ---
 

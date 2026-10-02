@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Pixels Dojo Companion",
   "short_name": "Pixels Dojo",
-  "version": "1.0.0",
+  "version": "0.2.0",
   "description": "Your AI companion for Pixels Online — get instant answers, strategy advice, and live updates from Pixin, Royagi, or Nyanko, right in the game.",
   "author": "Pixels Dojo",
   "icons": {
