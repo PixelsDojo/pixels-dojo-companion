@@ -3,11 +3,11 @@ import { fetchItems, fetchAchievements, fetchLocaleNameMap } from "./gameLibrary
 import {
   db, CatalogRow,
   upsertCatalogRow, getCatalogRow, listCatalogRows, countCatalogRows,
-  clearCatalog, getCatalogMeta, upsertCatalogMeta, getAllLocaleRows,
+  clearCatalog, getCatalogMeta, upsertCatalogMeta, getAllLocaleRows, getMarketPrice,
 } from "../db/database";
 
 // Bump this whenever builder logic or schema changes so Railway auto-rebuilds.
-const CATALOG_BUILDER_VERSION = "7";
+const CATALOG_BUILDER_VERSION = "17";
 
 // ---------------------------------------------------------------------------
 // Damerau-Levenshtein distance (optimal string alignment)
@@ -63,18 +63,22 @@ const GATHERING_FAMILIES: Array<{
   { regex: /^itm_turkey_(?!01$)/,            skill: "petcare", industry: "animal product", source_label: "Animal: Turkey", entity_id: "ent_turkey"        },
   { regex: /^itm_dragon_/,                   skill: "petcare", industry: "animal product", source_label: "Animal: Dragon", entity_id: "ent_legacy_dragon" },
   { regex: /^itm_silkslug(?:slime|spider)$/, skill: "petcare", industry: "animal product", source_label: "Sluggery",       entity_id: "ent_sluggery"      },
+  // Silk Fiber is a Silk Slug hutch product (confirmed by Lizzy)
+  { regex: /^itm_silkfiber$/,               skill: "petcare", industry: "animal product", source_label: "Silk Slug Hutch", entity_id: "ent_sluggery"      },
   { regex: /^itm_chicken_spaceEgg$/,         skill: "petcare", industry: "animal product", source_label: "Coop",           entity_id: "ent_coop"          },
   // Singles — each needs its own entry to carry the correct source
   { regex: /^itm_honey$/,                    skill: "petcare", industry: "animal product", source_label: "Apiary",         entity_id: "ent_apiary"        },
   { regex: /^itm_beeswax$/,                  skill: "petcare", industry: "animal product", source_label: "Apiary",         entity_id: "ent_apiary"        },
   { regex: /^itm_milk$/,                     skill: "petcare", industry: "animal product", source_label: "Animal: Cow",    entity_id: "ent_cow_pickup"    },
   { regex: /^itm_egg$/,                      skill: "petcare", industry: "animal product", source_label: "Coop",           entity_id: "ent_coop"          },
+  // Wool Wad: harvested from Sheep, not from Woolyweed crop (Lizzy confirmed)
+  { regex: /^itm_woolyweedFruit$/,           skill: "petcare", industry: "animal product", source_label: "Animal: Sheep",  entity_id: "ent_sheep_01"      },
 ];
 
 // Items that require a specific land type — confirmed by Lizzy.
 // Key = item_id, value = { land_type, category, industry, skill }
 const LAND_LOCKED_ITEMS: Record<string, {
-  land_type: string;
+  land_type?: string;
   category: "gathered" | "crop";
   industry: string;
   skill: string;
@@ -89,12 +93,16 @@ const LAND_LOCKED_ITEMS: Record<string, {
   itm_wintermintFruit:{ land_type: "WATER", category: "crop",     industry: "farm",    skill: "farming", seedId: "itm_wintermintSeeds"  },
   itm_magnoot:        { land_type: "GRASS", category: "crop",     industry: "farm",    skill: "farming", seedId: "itm_magnoot_seeds"    },
   itm_tenta:          { land_type: "SPACE", category: "crop",     industry: "farm",    skill: "farming", seedId: "itm_tentacactus"      },
+  // Silk Fiber: comes from Silk Slugs (Sluggery / Silk Slug Hutch)
+  itm_silkfiber:      { category: "gathered", industry: "slug",   skill: "petcare"    },
 };
 
 const LAND_TYPE_LABELS: Record<string, string> = {
   WATER: "water land",
   GRASS: "grass land",
   SPACE: "space land",
+  // Crawler stores grass/soil terrain as "land" (not "grass")
+  LAND: "grass land",
 };
 
 function tierFromId(id: string): number | null {
@@ -108,9 +116,13 @@ function levelForTier(tier: number): number {
 }
 
 const TOOL_SKILL_PATTERNS: Array<{ regex: RegExp; skill: string; type: string }> = [
-  { regex: /^itm_pickaxe/i, skill: "mining",   type: "pickaxe" },
-  { regex: /^itm_axe/i,     skill: "forestry", type: "axe" },
-  { regex: /^itm_shears/i,  skill: "farming",  type: "shears" },
+  { regex: /^itm_pickaxe/i,    skill: "mining",     type: "pickaxe" },
+  { regex: /^itm_duraPick/i,   skill: "mining",     type: "pickaxe" },
+  { regex: /^itm_axe/i,        skill: "forestry",   type: "axe" },
+  { regex: /^itm_duraAxe/i,    skill: "forestry",   type: "axe" },
+  { regex: /^itm_shears/i,     skill: "farming",    type: "shears" },
+  { regex: /^itm_duraShears/i, skill: "farming",    type: "shears" },
+  { regex: /^itm_fishing_rod|^itm_beginner_fishing_rod/i, skill: "exploration", type: "fishing_rod" },
 ];
 
 function toolSkillFromId(id: string): { skill: string; type: string } | null {
@@ -119,6 +131,108 @@ function toolSkillFromId(id: string): { skill: string; type: string } | null {
   }
   return null;
 }
+
+// Infer skill from station when requiredSkill is null.
+// Returns null for stations that shouldn't infer a skill (industries, inactiveIndustries, etc.)
+const STATION_TO_SKILL: Record<string, string | null> = {
+  woodwork:            "woodwork",
+  stoneshaping:        "stoneshaping",
+  metalworking:        "metalworking",
+  cooking:             "cooking",
+  winery:              "business",
+  textile_mill:        "business",
+  windmill:            "business",
+  compost:             "farming",
+  landbbq:             "cooking",
+  waterbbq:            "cooking",
+  spacebbq:            "cooking",
+  juicer:              "cooking",
+  forge:               "metalworking",
+  sushi:               "cooking",
+  publicsushi:         "cooking",
+  farming:             "farming",
+  industries:          null,    // building kits — no gameplay skill
+  inactiveIndustries:  null,
+};
+
+// Stations whose recipes are event / test / tutorial / inactive — items from these are retired.
+// publicsushi is a permanent public-land station (not event), so it is excluded here;
+// its recipes carry explicit requiredSkill and sort after real sushi recipes.
+const EVENT_STATIONS = new Set([
+  "moca", "moca2", "lantern", "sweater", "woodboxing", "moki_birthday",
+  "harvesthustle", "clovercraft", "tutorialcooking",
+  "shake", "inactiveIndustries",
+]);
+
+// Achievement IDs whose items are explicitly retired regardless of station.
+// ach_runningShoe_basic: the "Genesis Runners" textile_mill recipe was removed
+// from the game — the item is no longer obtainable through crafting.
+const EXPLICITLY_RETIRED_ACH_IDS = new Set([
+  "ach_runningShoe_basic",
+]);
+
+// Friendly display names for station IDs.
+const STATION_DISPLAY_NAMES: Record<string, string> = {
+  windmill:              "Windmill",
+  compost:               "Compost Bin",
+  textile_mill:          "Textile Mill",
+  quantum_recombinator:  "Quantum Recombinator",
+  woodwork:              "Woodwork Table",
+  stoneshaping:          "Stoneshaping Table",
+  metalworking:          "Metalworking Station",
+  cooking:               "Kitchen",
+  winery:                "Winery",
+  landbbq:               "Grass BBQ",
+  waterbbq:              "Water BBQ",
+  spacebbq:              "Space BBQ",
+  juicer:                "Juicer",
+  forge:                 "Forge",
+  sushi:                 "Sushi Station",
+  publicsushi:           "Public Sushi Station",
+  industries:            "Ministry of Innovation",
+  inactiveIndustries:    "Ministry of Innovation (inactive)",
+};
+
+// Maps achievement IDs (non-autoGrant) to the recipe-unlock item and its source.
+// autoGrant absent = recipe is greyed out in the station book until the player
+// consumes the matching recipe item to permanently (or per-craft) unlock it.
+const RECIPE_UNLOCK_MAP: Record<string, { item: string; source: string }> = {
+  // Sushi Kits — single-use recipe, re-buy at Ministry of Innovation for each craft
+  "ach_sushi_kit_01": { item: "itm_sushi_kit1_recipe",    source: "Ministry of Innovation store (single-use — buy each craft)" },
+  "ach_sushi_kit_02": { item: "itm_sushi_kit2_recipe",    source: "Ministry of Innovation store (single-use — buy each craft)" },
+  "ach_sushi_kit_03": { item: "itm_sushi_kit3_recipe",    source: "Ministry of Innovation store (single-use — buy each craft)" },
+  "ach_sushi_kit_04": { item: "itm_sushi_kit4_recipe",    source: "Ministry of Innovation store (single-use — buy each craft)" },
+  "ach_sushi_kit_05": { item: "itm_sushi_kit5_recipe",    source: "Ministry of Innovation store (single-use — buy each craft)" },
+  // Barney's BBQ Kit — blueprint from in-game store (permanent unlock)
+  "ach_basicbbqkit":  { item: "itm_basicbbqblueprint",    source: "In-game store (blueprint — permanent unlock)" },
+  // Magnet
+  "ach_Magnet2":      { item: "itm_magnetRecipe",         source: "In-game store (recipe item)" },
+  // Fences
+  "ach_fence":        { item: "itm_fenceRecipe",          source: "In-game store (recipe item)" },
+  "ach_pinkFence":    { item: "itm_pinkFence_ach",        source: "Limited-release item" },
+  "ach_greenFence":   { item: "itm_greenFence_ach",       source: "Limited-release item" },
+  // Mini Farmamix
+  "ach_minifarmamix": { item: "itm_minifarmamixRecipe",   source: "In-game store (single-use)" },
+  // Valley Path — tradeable on marketplace
+  "ach_valleyPath":   { item: "itm_valleyPathRecipe",     source: "Marketplace (tradeable item)" },
+  // Yield Reactors — single-use recipe, re-buy at Hearth Hall shop for each craft
+  "ach_celeReactor":  { item: "itm_celeReactorRecipe",    source: "Hearth Hall shop (single-use — buy each craft)" },
+  "ach_hartReactor":  { item: "itm_hartReactorRecipe",    source: "Hearth Hall shop (single-use — buy each craft)" },
+  "ach_clariReactor": { item: "itm_clariReactorRecipe",   source: "Hearth Hall shop (single-use — buy each craft)" },
+  "ach_bloomReactor": { item: "itm_bloomReactorRecipe",   source: "Hearth Hall shop (single-use — buy each craft)" },
+  "ach_pearlReactor": { item: "itm_pearlReactorRecipe",   source: "Hearth Hall shop (single-use — buy each craft)" },
+  // Textile Mill & Silk Slug Hutch — blueprints from Bitsy at Ministry of Innovation
+  "ach_Textile_Mill_Blueprint": { item: "itm_textilemill_recipe",    source: "Ministry of Innovation — Bitsy's Blueprint Station (permanent unlock)" },
+  "ach_sluggery":               { item: "itm_silkslug_hutch_recipe", source: "Ministry of Innovation — Bitsy's Blueprint Station (permanent unlock)" },
+  // Fire Blessing
+  "ach_fireBlessing": { item: "itm_fireBlessingRecipe",   source: "In-game store (recipe item)" },
+  // Bulk MooMunch
+  "ach_cowfeed_bulk": { item: "itm_bulkHay",              source: "In-game store (recipe item)" },
+  // Clover Fruit Jam Barrel
+  "ach_cloverfruitjam_barrel": { item: "itm_clvrJamBrrel", source: "In-game store (recipe item)" },
+  // Gummy Trash Can
+  "ach_trash_gummy":  { item: "itm_trash_gummy_recipe",   source: "In-game store (single-use)" },
+};
 
 // ---------------------------------------------------------------------------
 // buildCatalogRow — classify a single item and return a CatalogRow
@@ -144,12 +258,16 @@ function buildCatalogRow(
     plant_energy: null, harvest_energy: null, harvest_xp: null,
     recipe_station: null, recipe_inputs: null, recipe_output_qty: null,
     craft_time_minutes: null, craft_energy: null, craft_xp: null,
-    is_event_recipe: 0, all_recipes: null, land_type: null, library_ver: libraryVer,
+    is_event_recipe: 0, all_recipes: null, land_type: null,
+    recipe_unlock_item: null, recipe_unlock_source: null,
+    library_ver: libraryVer,
   };
 
   // -- Step 0: item.requirements.levels → gather skill (farming/mining/forestry only)
   // Guard: seeds also have farming level requirements — handle them in Step 1.6 instead.
-  if (item?.requirements?.levels?.length > 0 && !item?.onUse?.plant?.fruit) {
+  // Guard: tool items (axe/pickaxe/shears) have forestry/mining/farming level requirements
+  // but are craftable — skip early-return so Step 1 can find their achievement recipes.
+  if (item?.requirements?.levels?.length > 0 && !item?.onUse?.plant?.fruit && !toolSkillFromId(itemId)) {
     const req = item.requirements.levels[0];
     const skill: string | null = typeof req.levelType === "string" ? req.levelType.toLowerCase() : null;
     const lvl: number | null = typeof req.level === "number" ? req.level : null;
@@ -186,7 +304,7 @@ function buildCatalogRow(
       level_required: ll.category === "crop"
         ? (farmingReq?.level ?? null)
         : (miningReq?.level ?? null),
-      land_type: ll.land_type,
+      land_type: ll.land_type ?? null,
       ...(ll.category === "crop" && ll.seedId ? {
         seed_id: ll.seedId,
         seed_name: seedName,
@@ -225,14 +343,7 @@ function buildCatalogRow(
   }
 
   if (craftableEntries.length > 0) {
-    // Sort ascending by requiredLevel so primary = lowest-requirement recipe
-    craftableEntries.sort((a, b) => {
-      const la = typeof a.craftable.requiredLevel === "number" ? a.craftable.requiredLevel : 0;
-      const lb = typeof b.craftable.requiredLevel === "number" ? b.craftable.requiredLevel : 0;
-      return la - lb;
-    });
-
-    const buildRecipeData = (c: any) => {
+    const buildRecipeData = (c: any, achId: string) => {
       const reqItems: any[] = c.requiredItems ?? [];
       const inputs = reqItems.map((ri: any) => ({
         id: ri?.id ?? "",
@@ -243,26 +354,59 @@ function buildCatalogRow(
       const outputQty = resultItems.reduce((s: number, ri: any) => ri?.id === itemId ? s + (ri?.quantity ?? 1) : s, 0) || 1;
       const exps: any[] = c.result?.exps ?? [];
       const craftXp = exps.reduce((s: number, e: any) => s + (typeof e?.exp === "number" ? e.exp : 0), 0);
+      const stationType: string | null = typeof c.type === "string" ? c.type : null;
+      // A recipe is retired when: event/test station, test achId, or explicitly flagged.
+      // autoGrant absent = recipe needs unlock item (greyed out until consumed) — still craftable.
+      const isEvent: 0 | 1 = (EXPLICITLY_RETIRED_ACH_IDS.has(achId) ||
+        EVENT_STATIONS.has(stationType ?? "") ||
+        /quest|event|seasonal|inactive/i.test(stationType ?? "") ||
+        /[_-]test$|^ach_water ?test/i.test(achId)) ? 1 : 0;
+      // Skill: use requiredSkill if present, else infer from station type
+      const rawSkill = typeof c.requiredSkill === "string" ? c.requiredSkill.toLowerCase() : null;
+      const skill = rawSkill ?? (stationType && stationType in STATION_TO_SKILL ? STATION_TO_SKILL[stationType] : null);
       return {
-        station: typeof c.type === "string" ? c.type : null,
-        skill: typeof c.requiredSkill === "string" ? c.requiredSkill.toLowerCase() : null,
+        station: stationType,
+        skill,
         levelRequired: typeof c.requiredLevel === "number" ? c.requiredLevel : null,
         inputs,
         outputQty,
         craftTimeMinutes: typeof c.minutesRequired === "number" ? c.minutesRequired : null,
         energy: typeof c.energy === "number" ? c.energy : null,
         craftXp: craftXp || null,
-        isEvent: /quest|event|seasonal/i.test(c.type ?? "") ? 1 : 0,
+        isEvent,
       };
     };
 
-    const primary = buildRecipeData(craftableEntries[0].craftable);
+    // Sort: autoGrant:true (in-game visible) first, then non-event, then ascending level.
+    craftableEntries.sort((a, b) => {
+      const ag_a = a.craftable.autoGrant === true ? 0 : 1;
+      const ag_b = b.craftable.autoGrant === true ? 0 : 1;
+      if (ag_a !== ag_b) return ag_a - ag_b;
+      const ae = EVENT_STATIONS.has(a.craftable.type ?? "") ? 1 : 0;
+      const be = EVENT_STATIONS.has(b.craftable.type ?? "") ? 1 : 0;
+      if (ae !== be) return ae - be;
+      const la = typeof a.craftable.requiredLevel === "number" ? a.craftable.requiredLevel : 0;
+      const lb = typeof b.craftable.requiredLevel === "number" ? b.craftable.requiredLevel : 0;
+      return la - lb;
+    });
+
     const allRecipesData = craftableEntries.map(({ achId, craftable: c }) => ({
       achId,
-      ...buildRecipeData(c),
+      ...buildRecipeData(c, achId),
     }));
 
-    return {
+    const primary = allRecipesData[0];
+
+    // If ALL recipes are event/test/inactive, classify as retired
+    const allRetired = allRecipesData.every(r => r.isEvent === 1);
+    if (allRetired) {
+      return { ...base, category: "retired" };
+    }
+
+    const primaryAchId = craftableEntries[0].achId;
+    const unlockInfo = RECIPE_UNLOCK_MAP[primaryAchId] ?? null;
+
+    const craftedRow: Omit<CatalogRow, "updated_at"> = {
       ...base,
       category: "crafted",
       industry: primary.station ?? primary.skill ?? null,
@@ -276,7 +420,28 @@ function buildCatalogRow(
       craft_xp: primary.craftXp,
       is_event_recipe: primary.isEvent,
       all_recipes: craftableEntries.length > 1 ? JSON.stringify(allRecipesData) : null,
+      recipe_unlock_item: unlockInfo?.item ?? null,
+      recipe_unlock_source: unlockInfo?.source ?? null,
     };
+
+    // Tool items with recipes: override category to "tool", use the item's USE skill
+    const toolInfo = toolSkillFromId(itemId);
+    if (toolInfo) {
+      const useReq = item?.requirements?.levels?.find((r: any) =>
+        typeof r.levelType === "string" && r.levelType.toLowerCase() === toolInfo.skill,
+      );
+      const useLv: number | null = typeof useReq?.level === "number" ? useReq.level : null;
+      return {
+        ...craftedRow,
+        category: "tool",
+        skill: toolInfo.skill,
+        tool_type: toolInfo.type,
+        tool_min_tier: item?.tier ?? null,
+        level_required: useLv,
+      };
+    }
+
+    return craftedRow;
   }
 
   // -- Step 1.5: GATHERING_FAMILIES
@@ -346,8 +511,16 @@ function buildCatalogRow(
     };
   }
 
-  // -- Tool items (pickaxe/axe/shears) — skip entirely
-  if (toolSkillFromId(itemId)) return null;
+  // -- Tool items (pickaxe/axe/shears) — if no recipe was found above, include with
+  // level data so the tools guide fast path can still show the unlock requirement.
+  const toolFallback = toolSkillFromId(itemId);
+  if (toolFallback) {
+    const skillReq = item?.requirements?.levels?.find((r: any) => r.levelType === toolFallback.skill);
+    const lvl: number | null = typeof skillReq?.level === "number" ? skillReq.level : (
+      item?.tier != null ? (TIER_MIN_LEVEL[Math.max(1, Math.min(5, item.tier as number))] ?? null) : null
+    );
+    return { ...base, category: "tool", skill: toolFallback.skill, level_required: lvl };
+  }
 
   // No classification found — include in catalog as unknown so we can answer honestly
   return { ...base, category: null };
@@ -366,6 +539,7 @@ export interface CatalogBreakdown {
   animal: number;
   gathered_other: number;
   crafted: number;
+  tool: number;
   retired: number;
   skipped_no_name: number;
   unclassified: number;
@@ -409,7 +583,7 @@ export async function rebuildCatalogIfNeeded(
 
   const breakdown: CatalogBreakdown = {
     crop: 0, seed: 0, mined: 0, chopped: 0, animal: 0,
-    gathered_other: 0, crafted: 0, retired: 0,
+    gathered_other: 0, crafted: 0, tool: 0, retired: 0,
     skipped_no_name: 0, unclassified: 0,
   };
 
@@ -435,6 +609,8 @@ export async function rebuildCatalogIfNeeded(
       else                                         breakdown.gathered_other++;
     }
     else if (row.category === "crafted") breakdown.crafted++;
+    else if (row.category === "tool")    breakdown.tool++;
+    else if (row.category === "retired") breakdown.retired++;
     else if (row.category === null) {
       breakdown.unclassified++;
       if (RAW_MATERIAL_RE.test(itemId) || RAW_MATERIAL_RE.test(row.display_name)) {
@@ -482,6 +658,7 @@ export async function rebuildCatalogIfNeeded(
       recipe_station: null, recipe_inputs: null, recipe_output_qty: null,
       craft_time_minutes: null, craft_energy: null, craft_xp: null,
       is_event_recipe: 0, all_recipes: null, land_type: null,
+      recipe_unlock_item: null, recipe_unlock_source: null,
       library_ver: libraryVer,
     });
     addedIds.add(retiredItemId);
@@ -510,9 +687,9 @@ export async function rebuildCatalogIfNeeded(
   const msg = [
     `Catalog rebuilt: ${total} rows`,
     `(crop=${breakdown.crop} seed=${breakdown.seed} mined=${breakdown.mined} chopped=${breakdown.chopped}`,
-    `animal=${breakdown.animal} gathered_other=${breakdown.gathered_other} crafted=${breakdown.crafted}`,
-    `retired=${breakdown.retired} skipped=${breakdown.skipped_no_name}`,
-    `unclassified=${breakdown.unclassified})`,
+    `animal=${breakdown.animal} gathered_other=${breakdown.gathered_other}`,
+    `crafted=${breakdown.crafted} tool=${breakdown.tool} retired=${breakdown.retired}`,
+    `skipped=${breakdown.skipped_no_name} unclassified=${breakdown.unclassified})`,
     `${removedIds.length} removed. ver=${libraryVer} builder=v${CATALOG_BUILDER_VERSION}`,
   ].join(" ");
   console.log(`[gameCatalog] ${msg}`);
@@ -576,6 +753,22 @@ export interface FuzzyMatch {
   itemId: string;
   displayName: string;
   distance: number;
+}
+
+// Like fuzzyResolveName but uses full-name DL distance only (no word-level bonus).
+// Safer for short / ambiguous queries: "Clover Fruit" won't match "Clover Fruit Jam".
+export function fuzzyResolveNameStrict(query: string, maxDist = 1): FuzzyMatch | null {
+  const q = query.toLowerCase().trim();
+  if (!q) return null;
+  const rows = listCatalogRows();
+  let best: FuzzyMatch | null = null;
+  for (const row of rows) {
+    const d = damerauLevenshtein(q, row.display_name.toLowerCase());
+    if (d <= maxDist && (!best || d < best.distance)) {
+      best = { itemId: row.item_id, displayName: row.display_name, distance: d };
+    }
+  }
+  return best;
 }
 
 export function fuzzyResolveName(query: string, maxDist = 2): FuzzyMatch | null {
@@ -656,17 +849,37 @@ export function findRecipesUsingItem(itemId: string): Array<{ consumerName: stri
 // ---------------------------------------------------------------------------
 
 const SKILL_DISPLAY_NAMES: Record<string, string> = {
-  exploration: "Exploration",
-  petcare: "Animal Care",
-  farming: "Farming",
-  mining: "Mining",
-  forestry: "Forestry",
-  crafting: "Crafting",
+  exploration:  "Exploration",
+  petcare:      "Animal Care",
+  farming:      "Farming",
+  mining:       "Mining",
+  forestry:     "Forestry",
+  woodwork:     "Woodwork",
+  stoneshaping: "Stoneshaping",
+  metalworking: "Metalworking",
+  cooking:      "Cooking",
+  business:     "Business",
+  overall:      "General",
 };
 
 function skillDisplayName(skill: string | null): string {
   if (!skill) return "skill";
   return SKILL_DISPLAY_NAMES[skill] ?? (skill.charAt(0).toUpperCase() + skill.slice(1));
+}
+
+function stationDisplayName(raw: string | null | undefined): string {
+  if (!raw) return "";
+  return STATION_DISPLAY_NAMES[raw] ?? raw.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+}
+
+function appendMarketPrice(itemId: string, answer: string): string {
+  const mp = getMarketPrice(itemId);
+  if (!mp || mp.min_price <= 0) return answer;
+  const listings = mp.volume > 0 ? ` (${mp.volume.toLocaleString()} units in stock)` : "";
+  const avgNote = mp.avg_price > 0 && Math.abs(mp.avg_price - mp.min_price) > 10
+    ? `, avg ~${Math.round(mp.avg_price).toLocaleString()}`
+    : "";
+  return answer + ` Marketplace: lowest ~${Math.round(mp.min_price).toLocaleString()} coins${avgNote}${listings}.`;
 }
 
 function formatGrowMinutes(minutes: number): string {
@@ -684,13 +897,14 @@ export function generateFastAnswer(
   question: string,
   playerSkills?: Record<string, number>,
   playerInventory?: Record<string, number>,
+  playerOwnedLandType?: string | null,
 ): string | null {
   const q = question.toLowerCase();
   const name = row.display_name;
 
-  // retired recipe — no crafting data available
+  // retired recipe — no longer craftable in-game
   if (row.category === "retired") {
-    return `${name} isn't craftable at the moment — it was an old recipe that may come back.`;
+    return `${name} can't be crafted in-game — it was retired. If you need one, check the marketplace to see if a copy is listed.`;
   }
 
   // grow time question
@@ -712,39 +926,69 @@ export function generateFastAnswer(
     return answer;
   }
 
-  // recipe question
-  if (/\b(?:recipe|ingredient|craft|how\s+to\s+make|how\s+to\s+craft)\b/.test(q) && (row.recipe_inputs || row.all_recipes)) {
-    // Multiple recipes — list each one
+  // recipe question — "how do i make X", "what's the recipe for X", "ingredients for X", etc.
+  if (/\b(?:recipes?|ingredients?|craft|how\s+to\s+(?:make|craft)|how\s+(?:do\s+i|can\s+i)\s+(?:make|craft))\b/.test(q) && (row.recipe_inputs || row.all_recipes)) {
+    // Multiple recipes — merge those with identical inputs, then list each distinct recipe
     if (row.all_recipes) {
-      const recipes: Array<{
+      type RecipeEntry = {
         achId: string; station: string | null; skill: string | null;
         levelRequired: number | null; inputs: Array<{id: string; name: string; qty: number}>;
         outputQty: number; craftTimeMinutes: number | null; energy: number | null;
         craftXp: number | null; isEvent: number;
-      }> = JSON.parse(row.all_recipes);
-      const parts = recipes.map((r, i) => {
-        const ingStr = r.inputs.map(inp => `${inp.qty}x ${inp.name}`).join(", ");
-        let s = `Recipe ${i + 1}: ${ingStr} → ${r.outputQty}x ${name}`;
-        if (r.station) s += ` (${r.station})`;
-        if (r.levelRequired) s += `, requires level ${r.levelRequired}`;
-        if (r.energy) s += `, ${r.energy} energy`;
-        if (r.craftXp) s += `, ${r.craftXp} XP`;
+      };
+      const recipes: RecipeEntry[] = JSON.parse(row.all_recipes);
+      // Group by canonical inputs key; merge station names for identical inputs
+      const groups = new Map<string, RecipeEntry[]>();
+      for (const r of recipes) {
+        const key = r.inputs.map(i => `${i.id}:${i.qty}`).sort().join("|");
+        if (!groups.has(key)) groups.set(key, []);
+        groups.get(key)!.push(r);
+      }
+      const parts: string[] = [];
+      for (const group of groups.values()) {
+        const r = group[0];
+        const stationNames = group.map(g => g.station ? stationDisplayName(g.station) : null).filter(Boolean) as string[];
+        const stationStr = stationNames.length > 1
+          ? `${stationNames[0]} (or ${stationNames.slice(1).join(" or ")})`
+          : stationNames[0] ?? "";
+        const meta: string[] = [];
+        if (r.levelRequired) meta.push(`level ${r.levelRequired}`);
+        if (r.energy) meta.push(`${r.energy} energy`);
+        if (r.craftXp) meta.push(`+${r.craftXp} XP`);
+        const metaStr = meta.join(" · ");
+        const ingStr = r.inputs.map(inp => {
+          const have = playerInventory != null ? (playerInventory[inp.id] ?? 0) : null;
+          const haveNote = have !== null ? ` (have ${have}${have >= inp.qty ? " ✓" : ""})` : "";
+          return `${inp.qty} ${inp.name}${haveNote}`;
+        }).join(" · ");
+        let s = name;
+        if (stationStr) s += ` — ${stationStr}`;
+        if (metaStr) s += ` · ${metaStr}`;
+        s += `. Needs: ${ingStr}`;
         if (r.isEvent) s += ` [event/seasonal]`;
-        return s;
-      });
-      return `${name} has ${recipes.length} recipes:\n${parts.join("\n")}`;
+        parts.push(s);
+      }
+      if (parts.length === 1) return `${parts[0]}.`;
+      return `${name} has ${parts.length} different recipes:\n${parts.join("\n")}`;
     }
     // Single recipe
     if (row.recipe_inputs) {
       const inputs: Array<{ id: string; name: string; qty: number }> = JSON.parse(row.recipe_inputs);
-      const ingStr = inputs.map(i => `${i.qty}x ${i.name}`).join(", ");
-      let answer = `To craft ${name} you need: ${ingStr}.`;
-      if (row.recipe_station) answer += ` (station: ${row.recipe_station})`;
-      if (row.skill && row.level_required) {
-        answer += ` Requires ${row.skill} level ${row.level_required}.`;
-      }
-      if (row.craft_energy) answer += ` Costs ${row.craft_energy} energy.`;
-      if (row.craft_xp) answer += ` Gives ${row.craft_xp} XP.`;
+      const stationStr = row.recipe_station ? stationDisplayName(row.recipe_station) : "";
+      const meta: string[] = [];
+      if (row.level_required) meta.push(`level ${row.level_required}`);
+      if (row.craft_energy) meta.push(`${row.craft_energy} energy`);
+      if (row.craft_xp) meta.push(`+${row.craft_xp} XP`);
+      const metaStr = meta.join(" · ");
+      const ingStr = inputs.map(i => {
+        const have = playerInventory != null ? (playerInventory[i.id] ?? 0) : null;
+        const haveNote = have !== null ? ` (have ${have}${have >= i.qty ? " ✓" : ""})` : "";
+        return `${i.qty} ${i.name}${haveNote}`;
+      }).join(" · ");
+      let answer = name;
+      if (stationStr) answer += ` — ${stationStr}`;
+      if (metaStr) answer += ` · ${metaStr}`;
+      answer += `. Needs: ${ingStr}.`;
       return answer;
     }
   }
@@ -754,29 +998,28 @@ export function generateFastAnswer(
     return `${name} requires a ${row.tool_type} tier ${row.tool_min_tier} or better.`;
   }
 
-  // seed question
-  if (/\b(?:seed|plant|how\s+to\s+farm|how\s+to\s+grow)\b/.test(q) && row.seed_name) {
+  // seed question — but NOT "can i plant X" which needs the Yes/No crop path
+  const isCanPlantQ = /\bcan\s+i\s+(?:plant|grow|farm)\b/i.test(q);
+  if (!isCanPlantQ && /\b(?:seed|plant|how\s+to\s+farm|how\s+to\s+grow)\b/.test(q) && row.seed_name) {
     let answer = `${name} is grown by planting ${row.seed_name}.`;
     if (row.grow_time_minutes !== null) answer += ` It takes ${formatGrowMinutes(row.grow_time_minutes)} to grow.`;
     if (row.harvest_xp) answer += ` Gives ${row.harvest_xp} XP per harvest.`;
     return answer;
   }
 
-  // "where do I get / how do I get / where can I find" — resource access
+  // "where do I get / how do I get / where can I find / where can I buy" — resource access + market price
   if (/\b(?:where\s+(?:do\s+i\s+)?(?:get|find|obtain|buy)|how\s+(?:do\s+i\s+)?(?:get|obtain|find)|where\s+can\s+i\s+(?:get|find|obtain|buy)|how\s+to\s+(?:get|obtain|find))\b/.test(q)) {
-    return generateSourceAnswer(row, playerSkills, playerInventory);
+    return appendMarketPrice(row.item_id, generateSourceAnswer(row, playerSkills, playerInventory, playerOwnedLandType, question));
   }
 
-  // Bare item query — return full fact sheet: how obtained + used in.
-  const obtainedBy = generateSourceAnswer(row, playerSkills, playerInventory);
+  // Bare item query — return full fact sheet: how obtained + used in (omit if nothing uses it).
+  const obtainedBy = generateSourceAnswer(row, playerSkills, playerInventory, playerOwnedLandType, question);
   const usedIn = findRecipesUsingItem(row.item_id);
   let factSheet = obtainedBy;
   if (usedIn.length > 0) {
     factSheet += "\nUsed in: " + usedIn.map(u => `${u.consumerName} (${u.qty} each)`).join(", ") + ".";
-  } else {
-    factSheet += "\nUsed in: not found in any known crafting recipes.";
   }
-  return factSheet;
+  return appendMarketPrice(row.item_id, factSheet);
 }
 
 function bestToolTierInInventory(
@@ -798,6 +1041,8 @@ function generateSourceAnswer(
   row: CatalogRow,
   playerSkills?: Record<string, number>,
   playerInventory?: Record<string, number>,
+  playerOwnedLandType?: string | null,
+  question?: string,
 ): string {
   const name = row.display_name ?? row.item_id;
   const skill = row.skill;
@@ -806,13 +1051,30 @@ function generateSourceAnswer(
   const toolTier = row.tool_min_tier;
   const category = row.category;
 
+  if (category === "tool") {
+    if (row.recipe_inputs) {
+      try {
+        const inputs: Array<{ id: string; name: string; qty: number }> = JSON.parse(row.recipe_inputs);
+        const ingStr = inputs.map(i => `${i.qty}x ${i.name}`).join(", ");
+        let answer = `${name} is a craftable tool — make it using: ${ingStr}.`;
+        if (row.recipe_station) answer += ` Station: ${stationDisplayName(row.recipe_station)}.`;
+        if (row.tool_min_tier) answer += ` Tier ${row.tool_min_tier} ${row.tool_type ?? "tool"}.`;
+        return answer;
+      } catch { /* fall through */ }
+    }
+    return `${name} is a tool — craft it at a crafting station.`;
+  }
+
   if (category === "crafted") {
     if (row.recipe_inputs) {
       try {
         const inputs: Array<{ id: string; name: string; qty: number }> = JSON.parse(row.recipe_inputs);
         const ingStr = inputs.map(i => `${i.qty}x ${i.name}`).join(", ");
         let answer = `${name} is crafted — you make it using: ${ingStr}.`;
-        if (row.recipe_station) answer += ` Station: ${row.recipe_station}.`;
+        if (row.recipe_station) answer += ` Station: ${stationDisplayName(row.recipe_station)}.`;
+        if ((row as any).recipe_unlock_source) {
+          answer += ` Recipe unlock: ${(row as any).recipe_unlock_source}.`;
+        }
         if (skill && levelRequired) {
           const playerLv = playerSkills ? (playerSkills[skill.toLowerCase()] ?? 0) : 0;
           if (playerLv < levelRequired) {
@@ -832,22 +1094,81 @@ function generateSourceAnswer(
   if (category === "crop") {
     const playerFarmingLv = playerSkills ? (playerSkills["farming"] ?? 0) : 0;
     const canFarm = levelRequired === null || levelRequired === 0 || playerFarmingLv >= levelRequired;
-    const landLabel = row.land_type ? ` on ${LAND_TYPE_LABELS[row.land_type] ?? row.land_type.toLowerCase()}` : "";
+    const cropLandType = row.land_type ? row.land_type.toUpperCase() : null;
+    const landLabel = cropLandType ? ` on ${LAND_TYPE_LABELS[cropLandType] ?? cropLandType.toLowerCase()}` : "";
+    const isCanPlantQuestion = /\bcan\s+i\s+(?:plant|grow|farm)\b/i.test(question ?? "");
+
     let answer: string;
+
     if (!canFarm && levelRequired !== null) {
       answer = `You can't farm ${name} yet — you need Farming level ${levelRequired} (you're at ${playerFarmingLv}).`;
+    } else if (isCanPlantQuestion && !cropLandType) {
+      // Any-land crop (e.g. Muckchuck) — always yes
+      const ownedLabel = playerOwnedLandType
+        ? LAND_TYPE_LABELS[playerOwnedLandType.toUpperCase()] ?? `${playerOwnedLandType} land`
+        : undefined;
+      answer = ownedLabel
+        ? `Yes — ${name} grows on any land, including your ${ownedLabel}.`
+        : `Yes — ${name} grows on any land.`;
+    } else if (isCanPlantQuestion && cropLandType && playerOwnedLandType !== undefined) {
+      // "can i plant X" — lead with yes/no based on land ownership
+      const ownedNorm = (playerOwnedLandType ?? "").toUpperCase();
+      const needsSpecial = cropLandType === "WATER" || cropLandType === "SPACE";
+      const landName = LAND_TYPE_LABELS[cropLandType] ?? cropLandType.toLowerCase();
+      if (needsSpecial && ownedNorm !== cropLandType) {
+        answer = `No — ${name} grows on ${landName}, which you don't own.`;
+      } else if (needsSpecial && ownedNorm === cropLandType) {
+        answer = `Yes — ${name} grows on ${landName}, which you own.`;
+      } else if (!needsSpecial) {
+        // Grass-locked crop (e.g. Magnoot) — yes if on grass, no/generic if not
+        if (ownedNorm === "GRASS" || ownedNorm === "LAND") {
+          answer = `Yes — ${name} is a farm crop${landLabel}.`;
+        } else if (ownedNorm) {
+          answer = `Yes — ${name} grows on ${landName}. You're on ${LAND_TYPE_LABELS[ownedNorm] ?? ownedNorm.toLowerCase()}, which also works.`;
+        } else {
+          answer = `Yes — ${name} grows on ${landName}.`;
+        }
+      } else {
+        answer = `${name} is a farm crop${landLabel}.`;
+      }
     } else {
       answer = `${name} is a farm crop${landLabel}.`;
     }
+
     if (row.seed_name) {
-      answer += ` Plant ${row.seed_name}`;
+      answer += ` Plant ${row.seed_name} (bought at Buck's shop, unlocks at Farming level ${levelRequired ?? 0})`;
       if (row.grow_time_minutes !== null) answer += `, grows in ${formatGrowMinutes(row.grow_time_minutes)}`;
       answer += ".";
     }
     if (toolType && toolTier) {
       answer += ` Needs a ${toolType} tier ${toolTier}+.`;
     }
+    // Append public land finder when player lacks the required special land type
+    if (cropLandType && playerOwnedLandType !== undefined) {
+      const ownedNorm = (playerOwnedLandType ?? "").toUpperCase();
+      const needsSpecial = cropLandType === "WATER" || cropLandType === "SPACE";
+      if (needsSpecial && ownedNorm !== cropLandType) {
+        // Marker replaced at enrichFastAnswer time with actual public land list
+        answer += ` Use [[FIND_PUBLIC_LANDS:${cropLandType.toLowerCase()}:farm]] to find a public ${LAND_TYPE_LABELS[cropLandType] ?? cropLandType.toLowerCase()} with soil.`;
+      } else if (needsSpecial && ownedNorm === cropLandType && !isCanPlantQuestion) {
+        // Only append ownership note if not already in the yes/no lead
+        answer += ` You own ${LAND_TYPE_LABELS[cropLandType] ?? cropLandType.toLowerCase()} ✓.`;
+      }
+    }
     return answer;
+  }
+
+  if (category === "seed") {
+    const fruitName = row.seed_name ?? "the corresponding crop";
+    const farmingLv = levelRequired ?? 0;
+    let answer = `${name} is a seed sold at Buck's shop. It unlocks at Farming level ${farmingLv}.`;
+    answer += ` Plant it to grow ${fruitName}.`;
+    if (row.grow_time_minutes !== null) answer += ` Grows in ${formatGrowMinutes(row.grow_time_minutes)}.`;
+    return answer;
+  }
+
+  if (category === "retired") {
+    return `${name} can't be crafted in-game — it was retired. If you need one, check the marketplace to see if a copy is listed.`;
   }
 
   if (category === null) {
@@ -860,12 +1181,48 @@ function generateSourceAnswer(
     if (industry === "mine")                 verb = "mined";
     else if (industry === "forestry")        verb = "chopped from trees";
     else if (industry === "fishing")         verb = "caught by fishing";
-    else if (industry === "animal product")  verb = "obtained from an animal on your land";
+    else if (industry === "slug")            verb = "harvested from Silk Slugs in a Sluggery (Silk Slug Hutch)";
+    else if (industry === "animal product") {
+      // recipe_station stores source_label: "Animal: Cow", "Animal: Sheep", etc.
+      const src = row.recipe_station;
+      if (src) {
+        const animal = src.replace(/^[Aa]nimal:\s*/, '').trim();
+        const plural = /^(sheep|deer|bison)$/i.test(animal) ? animal : `${animal}s`;
+        verb = `obtained from ${plural} (Animal Care)`;
+      } else {
+        verb = "obtained from an animal (Animal Care)";
+      }
+    }
     else                                     verb = "gathered";
 
-    const landLabel = row.land_type ? ` on ${LAND_TYPE_LABELS[row.land_type] ?? row.land_type.toLowerCase()}` : "";
+    const itemLandType = row.land_type ? row.land_type.toUpperCase() : null;
+    const landLabel = itemLandType ? ` on ${LAND_TYPE_LABELS[itemLandType] ?? itemLandType.toLowerCase()}` : "";
     const tierPart = row.tier ? ` (tier ${row.tier})` : "";
-    let answer = `${name} is ${verb}${landLabel}${tierPart}.`;
+
+    // Yes/No lead for land-locked gathered items when we know the player's land type
+    let answer: string;
+    if (itemLandType && playerOwnedLandType !== undefined && industry === "mine") {
+      const ownedNorm = (playerOwnedLandType ?? "").toUpperCase();
+      const landName = LAND_TYPE_LABELS[itemLandType] ?? itemLandType.toLowerCase();
+      const needsSpecial = itemLandType === "WATER" || itemLandType === "SPACE";
+      if (!needsSpecial) {
+        // Grass-locked mine item — if player has grass, they can mine it
+        const playerHasGrass = ownedNorm === "GRASS" || ownedNorm === "LAND";
+        if (playerHasGrass) {
+          answer = `Yes — ${name} is ${verb} on ${landName}${tierPart}, which you own.`;
+        } else {
+          answer = `${name} is ${verb}${landLabel}${tierPart}.`;
+        }
+      } else if (needsSpecial && ownedNorm === itemLandType) {
+        answer = `Yes — ${name} is ${verb} on ${landName}${tierPart}, which you own.`;
+      } else if (needsSpecial && ownedNorm !== itemLandType) {
+        answer = `${name} is ${verb} on ${landName}${tierPart}.`;
+      } else {
+        answer = `${name} is ${verb}${landLabel}${tierPart}.`;
+      }
+    } else {
+      answer = `${name} is ${verb}${landLabel}${tierPart}.`;
+    }
 
     if (levelRequired !== null && levelRequired > 0 && skill) {
       const playerLv = playerSkills ? (playerSkills[skill.toLowerCase()] ?? 0) : 0;
@@ -899,6 +1256,19 @@ function generateSourceAnswer(
         }
       } else if (toolType) {
         answer += ` No ${toolType} in your backpack.`;
+      }
+    }
+
+    // Land-finder markers for land-locked gathered items (mine/farming on specific land type)
+    if (itemLandType && playerOwnedLandType !== undefined && industry === "mine") {
+      const ownedNorm = (playerOwnedLandType ?? "").toUpperCase();
+      const needsSpecial = itemLandType === "WATER" || itemLandType === "SPACE";
+      if (needsSpecial && ownedNorm !== itemLandType) {
+        const landName = LAND_TYPE_LABELS[itemLandType] ?? itemLandType.toLowerCase();
+        answer += ` Use [[FIND_PUBLIC_LANDS:${itemLandType.toLowerCase()}:mine]] to find a public ${landName} with mining spots.`;
+      } else if (!needsSpecial && !(ownedNorm === "GRASS" || ownedNorm === "LAND")) {
+        const landName = LAND_TYPE_LABELS[itemLandType] ?? itemLandType.toLowerCase();
+        answer += ` Use [[FIND_PUBLIC_LANDS:${itemLandType.toLowerCase()}:mine]] to find a public ${landName} with mining spots.`;
       }
     }
 

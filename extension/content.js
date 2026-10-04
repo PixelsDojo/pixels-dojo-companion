@@ -89,6 +89,19 @@
       storageSetKey(key, updaterFn(current ?? defaultValue)));
   }
 
+  /** Deletes one top-level key from the root object. */
+  function storageDeleteKey(key) {
+    return storageGetAll().then(root => {
+      if (!_extContextOk()) return;
+      delete root[key];
+      return new Promise((resolve, reject) =>
+        chrome.storage.local.set({ [STORAGE_ROOT]: root }, () =>
+          chrome.runtime.lastError
+            ? reject(chrome.runtime.lastError)
+            : resolve()));
+    });
+  }
+
   // ---------------------------------------------------------------------------
   // Category-specific storage functions.
   //
@@ -239,6 +252,25 @@
         // requestPanelCache — injected.js asks for saved taskboard/stacked/chest snapshots
         case 'requestPanelCache': {
           const pid = data?.playerId ?? 'unknown';
+
+          // Merge backend chests into local cache (backend is source of truth across reinstalls)
+          if (pid !== 'unknown') {
+            try {
+              const resp = await fetch(`${BACKEND_URL}/api/player-storage?playerId=${encodeURIComponent(pid)}`);
+              if (resp.ok) {
+                const backendChests = await resp.json();
+                for (const [mid, chest] of Object.entries(backendChests)) {
+                  const localKey = `chestCache_${mid}`;
+                  const local = await storageGetKey(localKey);
+                  // backend wins if newer or local is absent
+                  if (!local || (chest.capturedAt ?? 0) > (local.capturedAt ?? 0)) {
+                    await storageSetKey(localKey, chest);
+                  }
+                }
+              }
+            } catch (_) { /* offline — use local cache */ }
+          }
+
           const [taskboard, stacked, allStorage, activityTimers, plotSeeds] = await Promise.all([
             storageGetKey(`panelCacheTaskboard_${pid}`),
             storageGetKey(`panelCacheStacked_${pid}`),
@@ -269,12 +301,39 @@
         // chestCache — injected.js persists contents of one opened chest
         case 'chestCache': {
           const mid = data?.mid ?? 'unknown';
-          await storageSetKey(`chestCache_${mid}`, {
-            items:      data.items      ?? [],
-            size:       data.size       ?? 0,
-            removeOnly: data.removeOnly ?? false,
-            capturedAt: data.capturedAt ?? Date.now(),
-          });
+          const chestVal = {
+            items:       data.items       ?? [],
+            size:        data.size        ?? 0,
+            removeOnly:  data.removeOnly  ?? false,
+            capturedAt:  data.capturedAt  ?? Date.now(),
+            storageName: data.storageName ?? null,
+            landId:      data.landId      ?? null,
+            entityType:  data.entityType  ?? null,
+            source:      data.source      ?? null,
+          };
+          await storageSetKey(`chestCache_${mid}`, chestVal);
+          // Also persist to backend so data survives reinstall
+          const pid = companion.latestPlayerContext?.playerId;
+          if (pid) {
+            fetch(`${BACKEND_URL}/api/player-storage/chest`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ playerId: pid, mid, ...chestVal }),
+            }).catch(() => { /* fire-and-forget */ });
+          }
+          return;
+        }
+        // chestCacheDelete — injected.js signals that a chest was removed from the current map
+        case 'chestCacheDelete': {
+          const mid = data?.mid;
+          if (!mid) return;
+          await storageDeleteKey(`chestCache_${mid}`);
+          const pid2 = companion.latestPlayerContext?.playerId;
+          if (pid2) {
+            fetch(`${BACKEND_URL}/api/player-storage/chest?playerId=${encodeURIComponent(pid2)}&mid=${encodeURIComponent(mid)}`, {
+              method: 'DELETE',
+            }).catch(() => { /* fire-and-forget */ });
+          }
           return;
         }
         // savePanelCache — injected.js persists a taskboard/stacked snapshot
@@ -390,7 +449,26 @@
     let diaryPage    = 1;
     let timerCountdownInterval = null;
 
+    // Storage modal state
+    let storageOpen       = false;
+    let _storageMode      = 'browse'; // 'browse' | 'totals'
+    let _storageMeta      = null;     // { itemId: { name, imageUrl } } — lazy loaded
+    let _storageMetaLoading = false;
+
     const CASUAL_GREETINGS = ["What's up?", "How can I help?", "What do you need?"];
+
+    // ---- Personal assistant state -------------------------------------------
+    let playerProfile    = null;   // {playStyle,goal,goalTarget,hasPet,petCount,petDetected,storage,taskboardMaxPrice,taskboardTooExpensive}
+    let profileLoaded    = false;  // true once storage was read for current player
+    let _profileBackendLoaded = false; // true once _loadPlayerPrefsFromBackend has settled
+    let _profileSetupActive = false;
+    let _profileSetupData   = {};   // accumulated answers; also used as a draft for resume
+    let nowDoingNote     = '';     // "Now doing" note text
+    let nowDoingSetAt    = 0;      // ms timestamp when note was set
+    let nowDoingLastRemindedMap = null; // last map where reminder was shown
+    let hearthHallSeasonStart = null;  // ms timestamp of detected HH season
+    let _briefPlanPostedDate  = null;  // UTC date string when post-brief plan was last posted
+    let _briefShownDate       = null;  // in-memory guard to prevent double-posting morning brief
 
     // ---- Sprite data URL helpers ----------------------------------------------
     // CSS url() inside an injected <style> tag is subject to the host page's
@@ -792,6 +870,32 @@
           border-color: rgba(98,42,255,0.8);
         }
         #px-send:disabled { opacity: 0.25; cursor: default; }
+        #px-pin-btn {
+          width: 30px; height: 30px; flex-shrink: 0;
+          background: #fffaf2; border: 2px solid #222; border-radius: 8px;
+          color: #222; font-size: 14px; cursor: pointer;
+          display: flex; align-items: center; justify-content: center;
+          padding: 0; box-shadow: 2px 2px 0 #222; transition: background 0.12s;
+        }
+        #px-pin-btn:hover { background: rgba(98,42,255,0.12); border-color: rgba(98,42,255,0.8); }
+        /* ── Choice buttons (profile setup, morning brief, etc.) ─────────── */
+        .px-msg-choices {
+          display: flex; flex-wrap: wrap; gap: 4px;
+          margin-top: 6px;
+        }
+        .px-choice-btn {
+          background: rgba(98,42,255,0.1); border: 1.5px solid rgba(98,42,255,0.6);
+          border-radius: 6px; color: rgba(98,42,255,0.95); font-family: inherit;
+          font-size: 9px; cursor: pointer; padding: 4px 8px; white-space: nowrap;
+          box-shadow: 1px 1px 0 rgba(98,42,255,0.3); transition: background 0.1s;
+        }
+        .px-choice-btn:hover { background: rgba(98,42,255,0.22); }
+        .px-profile-input {
+          flex: 1; background: #fffaf2; border: 1.5px solid #888; border-radius: 6px;
+          color: #222; font-family: inherit; font-size: 9px; padding: 4px 6px;
+          outline: none; box-sizing: border-box; min-width: 0;
+        }
+        .px-profile-input:focus { border-color: rgba(98,42,255,0.8); }
 
         /* ── Notebook / Diary modal ──────────────────────────────────────── */
         #px-notebook-modal {
@@ -1100,6 +1204,132 @@
           80%  { background-position: -384px 0; }
           90%  { background-position: -432px 0; }
         }
+
+        /* ── Storage pop-up modal ──────────────────────────────────────────── */
+        #px-storage-modal {
+          display: none; position: fixed; inset: 0; z-index: 100000;
+          background: rgba(0,0,0,0.55); align-items: center; justify-content: center;
+        }
+        #px-storage-modal.px-modal-visible { display: flex; }
+        #px-storage-modal-box {
+          background: #fffaf2; border: 2px solid #222; border-radius: 12px;
+          box-shadow: 4px 4px 0 #222; width: min(640px, 97vw);
+          max-height: calc(100vh - 40px); display: flex; flex-direction: column;
+          font-family: 'Press Start 2P', 'VT323', monospace, sans-serif;
+          font-size: 9px; overflow: hidden;
+        }
+        #px-storage-modal-header {
+          display: flex; align-items: center; gap: 6px;
+          padding: 10px 12px 8px; border-bottom: 2px solid #222; flex-shrink: 0;
+          flex-wrap: wrap;
+        }
+        #px-storage-modal-title { font-size: 10px; }
+        .px-storage-mode-btn {
+          background: #fffaf2; border: 2px solid #222; border-radius: 6px;
+          color: #222; font-family: inherit; font-size: 7px; cursor: pointer;
+          padding: 3px 8px; box-shadow: 2px 2px 0 #222; line-height: 1;
+        }
+        .px-storage-mode-btn:hover { background: #f0e6d4; }
+        .px-storage-mode-active {
+          background: rgba(98,42,255,0.1); border-color: rgba(98,42,255,0.9);
+          box-shadow: 2px 2px 0 rgba(98,42,255,0.6);
+        }
+        #px-storage-search {
+          background: #fffaf2; border: 1.5px solid #888; border-radius: 6px;
+          color: #222; font-family: inherit; font-size: 8px; padding: 3px 7px;
+          outline: none; flex: 1; min-width: 80px; max-width: 180px;
+        }
+        #px-storage-search:focus { border-color: rgba(98,42,255,0.7); }
+        #px-storage-modal-close {
+          background: none; border: none; font-family: inherit; font-size: 14px;
+          cursor: pointer; color: #222; padding: 2px 4px; line-height: 1; flex-shrink: 0;
+          margin-left: auto;
+        }
+        #px-storage-modal-close:hover { color: #622aff; }
+        #px-storage-content {
+          flex: 1 1 auto; min-height: 0; overflow-y: auto;
+          padding: 10px 12px 14px; display: flex; flex-direction: column; gap: 12px;
+        }
+        #px-storage-content::-webkit-scrollbar { display: block !important; width: 10px !important; }
+        #px-storage-content::-webkit-scrollbar-track { background: rgba(60,20,140,0.2) !important; border-radius: 5px !important; }
+        #px-storage-content::-webkit-scrollbar-thumb { background: rgba(98,42,255,0.4) !important; border-radius: 5px !important; min-height: 40px !important; }
+        #px-storage-modal .px-st-section-hdr {
+          font-size: 9px !important; color: rgba(98,42,255,0.9) !important;
+          border-bottom: 1.5px solid rgba(98,42,255,0.3) !important; padding-bottom: 4px !important;
+          margin-bottom: 5px !important; display: flex !important;
+          align-items: center !important; justify-content: space-between !important;
+        }
+        #px-storage-modal .px-st-section-count { font-size: 7px !important; color: #888 !important; }
+        #px-storage-modal .px-st-chest {
+          background: #fff8ee !important; border: 1.5px solid #ddd !important;
+          border-radius: 8px !important; padding: 7px 9px !important;
+          display: flex !important; flex-direction: column !important; gap: 5px !important;
+          margin-bottom: 5px !important;
+        }
+        #px-storage-modal .px-st-chest-hdr {
+          display: flex !important; align-items: center !important; gap: 6px !important;
+        }
+        #px-storage-modal .px-st-chest-name {
+          font-size: 8px !important; color: #333 !important; flex: 1 !important; word-break: break-word !important;
+        }
+        #px-storage-modal .px-st-chest-meta {
+          font-size: 7px !important; color: #888 !important; white-space: nowrap !important; flex-shrink: 0 !important;
+        }
+        #px-storage-modal .px-st-items {
+          display: flex !important; flex-wrap: wrap !important; gap: 5px !important;
+        }
+        #px-storage-modal .px-st-item {
+          position: relative !important; width: 46px !important; height: 46px !important;
+          background: #fffaf2 !important; border: 1.5px solid #ddd !important;
+          border-radius: 6px !important; cursor: default !important;
+          display: flex !important; align-items: center !important;
+          justify-content: center !important; overflow: visible !important;
+          flex-shrink: 0 !important; box-sizing: border-box !important;
+        }
+        #px-storage-modal .px-st-item:hover {
+          border-color: rgba(98,42,255,0.5) !important; background: #f5f0ff !important;
+        }
+        #px-storage-modal .px-st-icon {
+          width: 34px !important; height: 34px !important;
+          object-fit: contain !important; image-rendering: pixelated !important;
+          display: block !important; flex-shrink: 0 !important;
+        }
+        #px-storage-modal .px-st-icon-ph {
+          width: 34px !important; height: 34px !important; background: #eee !important;
+          border-radius: 4px !important; display: flex !important;
+          align-items: center !important; justify-content: center !important;
+          font-size: 11px !important; color: #bbb !important;
+        }
+        #px-storage-modal .px-st-qty {
+          position: absolute !important; bottom: 2px !important; right: 2px !important;
+          font-size: 6px !important; font-weight: 600 !important; line-height: 9px !important;
+          background: rgba(0,0,0,0.55) !important; color: #fff !important;
+          border-radius: 2px !important; padding: 0 2px !important;
+          pointer-events: none !important; display: block !important;
+        }
+        #px-storage-modal .px-st-chest-empty {
+          font-size: 7px !important; color: #aaa !important; font-style: italic !important;
+        }
+        #px-storage-modal .px-st-empty {
+          font-size: 8px !important; color: rgba(0,0,0,0.4) !important;
+          font-style: italic !important; padding: 4px 0 !important;
+        }
+        .px-st-search-summary {
+          font-size: 8px; color: rgba(98,42,255,0.85); padding: 2px 0;
+          border-bottom: 1px solid rgba(98,42,255,0.15); padding-bottom: 6px;
+        }
+        .px-st-totals-row {
+          display: flex; align-items: center; gap: 5px; padding: 3px 0;
+          border-bottom: 1px solid #eee;
+        }
+        .px-st-totals-icon { width: 18px; height: 18px; object-fit: contain; image-rendering: pixelated; flex-shrink: 0; }
+        .px-st-totals-icon-ph {
+          width: 18px; height: 18px; background: #eee; border-radius: 3px;
+          flex-shrink: 0; font-size: 8px; color: #bbb; display: flex; align-items: center; justify-content: center;
+        }
+        .px-st-totals-name { flex: 1; font-size: 8px; color: #333; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .px-st-totals-qty { font-size: 8px; font-weight: bold; color: #222; white-space: nowrap; }
+        .px-st-totals-detail { font-size: 6px; color: #888; white-space: nowrap; max-width: 130px; overflow: hidden; text-overflow: ellipsis; }
       `;
       (document.head || document.documentElement).appendChild(s);
     }
@@ -1139,6 +1369,7 @@
             <button class="px-hdr-btn" id="px-premium-btn" title="Premium companions">★</button>
           </div>
           <div id="px-header-right">
+            <button class="px-hdr-btn" id="px-storage-btn">📦 Storage</button>
             <button class="px-hdr-btn" id="px-diary-btn">Diary</button>
             <button class="px-hdr-btn" id="px-close-btn" title="Close panel">×</button>
             <button class="px-hdr-btn" id="px-dismiss-all-btn">Dismiss</button>
@@ -1148,6 +1379,7 @@
           <div class="px-empty">Ask me anything about Pixels!</div>
         </div>
         <div id="px-input-row">
+          <button id="px-pin-btn" title="What was I doing?">📌</button>
           <input id="px-input" type="text" placeholder="Ask me anything…" maxlength="500"/>
           <button id="px-send" title="Send">&#x27A4;</button>
         </div>
@@ -1182,11 +1414,15 @@
               <button class="px-nb-tab px-nb-tab-active" data-tab="diary">Diary</button>
               <button class="px-nb-tab" data-tab="notebook">Notebook</button>
               <button class="px-nb-tab" data-tab="timers">Timers</button>
+              <button class="px-nb-tab" data-tab="profile">My profile</button>
             </div>
             <button id="px-notebook-modal-close" title="Close">×</button>
           </div>
           <div id="px-nb-diary-panel" class="px-nb-panel px-nb-panel-active">
             <div id="px-nb-xp-section"></div>
+            <div style="display:flex;align-items:center;gap:6px;margin-bottom:2px">
+              <button class="px-nb-add-btn" id="px-nb-today-btn">☀️ Today</button>
+            </div>
             <div id="px-nb-diary-list"><div class="px-nb-loading">Loading…</div></div>
             <div id="px-nb-diary-pag" class="px-nb-pag-row"></div>
           </div>
@@ -1231,6 +1467,15 @@
               <div id="px-nb-craft-totals"></div>
             </div>
           </div>
+          <div id="px-nb-profile-panel" class="px-nb-panel">
+            <div class="px-nb-section">
+              <div class="px-nb-section-header">My Profile</div>
+              <div id="px-nb-profile-content" style="font-size:9px;line-height:1.9;color:#444;white-space:pre-line;padding:4px 0">Loading…</div>
+              <div class="px-nb-add-row" style="margin-top:6px">
+                <button class="px-nb-add-btn" id="px-nb-profile-setup">Update profile</button>
+              </div>
+            </div>
+          </div>
         </div>
       `;
       document.body.appendChild(nbModal);
@@ -1244,6 +1489,16 @@
       nbModal.querySelector('#px-nb-timer-add').addEventListener('click', addTimerItem);
       nbModal.querySelector('#px-nb-shopping-add').addEventListener('click', addShoppingItem);
       nbModal.querySelector('#px-nb-craft-calc').addEventListener('click', loadCraftTotals);
+      nbModal.querySelector('#px-nb-today-btn').addEventListener('click', () => {
+        closeNotebook();
+        openPanel();
+        showMorningBrief(true);
+      });
+      nbModal.querySelector('#px-nb-profile-setup').addEventListener('click', () => {
+        closeNotebook();
+        openPanel();
+        _startProfileSetup();
+      });
       // Stop key events from reaching Phaser for all notebook inputs
       nbModal.querySelectorAll('.px-nb-input').forEach(inp => {
         ['keydown','keyup','keypress'].forEach(ev =>
@@ -1258,11 +1513,47 @@
         });
       });
 
+      // Storage modal
+      const stModal = document.createElement('div');
+      stModal.id = 'px-storage-modal';
+      stModal.innerHTML = `
+        <div id="px-storage-modal-box">
+          <div id="px-storage-modal-header">
+            <span id="px-storage-modal-title">📦 Storage</span>
+            <button class="px-storage-mode-btn px-storage-mode-active" data-mode="browse">Browse</button>
+            <button class="px-storage-mode-btn" data-mode="totals">Totals</button>
+            <input id="px-storage-search" type="text" placeholder="Search items…" maxlength="80" autocomplete="off"/>
+            <button id="px-storage-modal-close" title="Close">×</button>
+          </div>
+          <div id="px-storage-content"></div>
+        </div>
+      `;
+      document.body.appendChild(stModal);
+      stModal.querySelector('#px-storage-modal-close').addEventListener('click', closeStorageModal);
+      stModal.addEventListener('click', e => { if (e.target === stModal) closeStorageModal(); });
+      stModal.querySelector('#px-storage-modal-header').addEventListener('click', e => {
+        const btn = e.target.closest('.px-storage-mode-btn');
+        if (!btn) return;
+        _storageMode = btn.dataset.mode;
+        stModal.querySelectorAll('.px-storage-mode-btn').forEach(b =>
+          b.classList.toggle('px-storage-mode-active', b.dataset.mode === _storageMode));
+        _renderStorage();
+      });
+      const searchEl = stModal.querySelector('#px-storage-search');
+      searchEl.addEventListener('input', () => _renderStorage());
+      ['keydown','keyup','keypress'].forEach(ev =>
+        searchEl.addEventListener(ev, e => { e.stopPropagation(); e.stopImmediatePropagation(); }));
+      searchEl.addEventListener('keydown', e => {
+        if (e.key === 'Escape') { e.preventDefault(); closeStorageModal(); }
+      });
+
       // ── Event listeners ──────────────────────────────────────────────────
+      panel.querySelector('#px-pin-btn').addEventListener('click', showWhatWasDoing);
       toggle.addEventListener('click', handleToriiClick);
       floatSprite.addEventListener('click', togglePanel);
       panel.querySelector('#px-dismiss-all-btn').addEventListener('click', fullDismiss);
       panel.querySelector('#px-close-btn').addEventListener('click', closePanel);
+      panel.querySelector('#px-storage-btn').addEventListener('click', openStorageModal);
       panel.querySelector('#px-diary-btn').addEventListener('click', openNotebook);
       panel.querySelector('#px-premium-btn').addEventListener('click', togglePremiumModal);
       panel.querySelector('#px-send').onclick = () => isBusy ? _stopMessage(_pendingQuestion) : sendMessage();
@@ -1285,6 +1576,14 @@
       });
       inputEl.addEventListener('keyup',    e => { e.stopPropagation(); e.stopImmediatePropagation(); });
       inputEl.addEventListener('keypress', e => { e.stopPropagation(); e.stopImmediatePropagation(); });
+
+      // Global Esc to close storage modal
+      document.addEventListener('keydown', e => {
+        if (e.key === 'Escape' && storageOpen) {
+          e.stopPropagation();
+          closeStorageModal();
+        }
+      }, true);
     }
 
     // ---- Greeting logic -------------------------------------------------------
@@ -1301,26 +1600,57 @@
       if (p === 'pixin' && !introSeen) {
         introSeen = true;
         storageSetKey('hasSeenIntro', true).catch(() => {});
+        const _pid0 = latestPlayerContext?.playerId;
+        if (_pid0) nbFetch('/api/player-prefs', { method: 'POST', body: JSON.stringify({ playerId: _pid0, key: 'hasSeenIntro', value: true }) }).catch(() => {});
         appendMessage('pixin', "Hi, I'm Pixin! I'd love to teach you how to play Pixels and figure out what's going on in the wide world of Terra Villa. Ask me about anything — quests, coins, crafting, you name it! If you want advanced gameplay advice and strategy on how to maximize your earnings, why not chat to my friends Royagi or Nyanko?");
+        setTimeout(_afterGreeting, 400);
         return;
       }
 
       if (p === 'goat' && !royagiIntroSeen) {
         royagiIntroSeen = true;
         storageSetKey('hasSeenRoyagiIntro', true).catch(() => {});
+        const _pid1 = latestPlayerContext?.playerId;
+        if (_pid1) nbFetch('/api/player-prefs', { method: 'POST', body: JSON.stringify({ playerId: _pid1, key: 'hasSeenRoyagiIntro', value: true }) }).catch(() => {});
         appendMessage('goat', "Ah, a fresh sprout seeking wisdom! I am Royagi, the old goat of this dojo — I've weathered more harvests than you've got hay bales. Ask me for the deep strategy on maximizing your Pixels, and I'll try not to buck any trends... too hard. What'll it be?");
+        setTimeout(_afterGreeting, 400);
         return;
       }
 
       if (p === 'cat' && !nyankoIntroSeen) {
         nyankoIntroSeen = true;
         storageSetKey('hasSeenNyankoIntro', true).catch(() => {});
+        const _pid2 = latestPlayerContext?.playerId;
+        if (_pid2) nbFetch('/api/player-prefs', { method: 'POST', body: JSON.stringify({ playerId: _pid2, key: 'hasSeenNyankoIntro', value: true }) }).catch(() => {});
         appendMessage('cat', "Meow~ I'm Nyanko! You're clearly already doing great things around here. I'm here to help with strategy, tips, and a bit of encouragement along the way. What are we working on?");
+        setTimeout(_afterGreeting, 400);
         return;
       }
 
       // All relevant intros already seen — casual greeting.
       appendMessage(p, CASUAL_GREETINGS[Math.floor(Math.random() * CASUAL_GREETINGS.length)]);
+      // After greeting: profile setup (if not done) or morning brief
+      setTimeout(_afterGreeting, 400);
+    }
+
+    function _afterGreeting() {
+      if (_profileSetupActive) return;
+      if (!_profileBackendLoaded) {
+        // Backend prefs haven't settled yet — defer until they do.
+        // _maybeStartSetupOrBrief() will be called from _loadPlayerPrefsFromBackend.
+        return;
+      }
+      _maybeStartSetupOrBrief();
+    }
+
+    function _maybeStartSetupOrBrief() {
+      if (_profileSetupActive) return;
+      if (!profileLoaded) return;
+      if (!playerProfile) {
+        if (latestPlayerContext?.playerId) _startProfileSetup();
+      } else {
+        checkMorningBrief();
+      }
     }
 
     // ---- First-activation + open / close ------------------------------------
@@ -1663,9 +1993,10 @@
           body:    JSON.stringify({
             question,
             context: {
-              player:        ctx,
+              player:        Object.assign({}, ctx, hearthHallSeasonStart ? { hearthHallSeasonStart } : {}),
               walletAddress: ctx.walletAddress ?? null,
               persona:       currentPersona,
+              profile:       playerProfile ?? undefined,
             },
           }),
         });
@@ -1703,10 +2034,28 @@
     }
 
     // ---- Game event handler --------------------------------------------------
-    function onGameEvent({ type, message }) {
+    function onGameEvent({ type, message, data }) {
       // Timer events are shown regardless of panel state (proactive notifications)
       if (type === 'timerReady' || type === 'awayTimers') {
         appendMessage(currentPersona, message ?? '');
+        return;
+      }
+      // Hearth Hall season detection
+      if (type === 'hearthHallSeason') {
+        hearthHallSeasonStart = data?.detectedAt ?? Date.now();
+        const pid = latestPlayerContext?.playerId;
+        if (pid) storageSetKey(`hearthHallSeason_${pid}`, hearthHallSeasonStart).catch(() => {});
+        return;
+      }
+      // Map change — show "Now doing" reminder if set and within 2 hours
+      if (type === 'map changed') {
+        const mapId = data ?? message;
+        if (nowDoingNote && (Date.now() - nowDoingSetAt) < 2 * 3_600_000) {
+          if (mapId !== nowDoingLastRemindedMap) {
+            nowDoingLastRemindedMap = mapId;
+            appendMessage('pixin', `📌 ${nowDoingNote}`);
+          }
+        }
         return;
       }
       if (!isOpen) return;
@@ -1716,6 +2065,455 @@
       if (type === 'stacked_offer_claimed') {
         appendMessage(currentPersona, 'Offer claimed! Reopen the Stacked App — new offers may have appeared.');
       }
+    }
+
+    // ---- Personal assistant helpers -----------------------------------------
+
+    function _appendMessageWithChoices(role, text, choices, onChoice) {
+      const id = appendMessage(role, text);
+      const el = document.getElementById(`px-msg-${id}`);
+      if (!el) return;
+      const row = document.createElement('div');
+      row.className = 'px-msg-choices';
+      for (const { label, value } of choices) {
+        const btn = document.createElement('button');
+        btn.className = 'px-choice-btn';
+        btn.textContent = label;
+        btn.addEventListener('click', () => { row.remove(); onChoice(value, label); });
+        row.appendChild(btn);
+      }
+      el.appendChild(row);
+      const list = document.getElementById('px-messages');
+      if (list) list.scrollTop = list.scrollHeight;
+    }
+
+    function _saveDraft() {
+      const pid = latestPlayerContext?.playerId;
+      if (!pid || Object.keys(_profileSetupData).length === 0) return;
+      storageSetKey(`playerProfileDraft_${pid}`, _profileSetupData).catch(() => {});
+      nbFetch('/api/player-prefs', { method: 'POST', body: JSON.stringify({ playerId: pid, key: 'playerProfileDraft', value: _profileSetupData }) }).catch(() => {});
+    }
+
+    function _startProfileSetup() {
+      if (_profileSetupActive) return;
+      _profileSetupActive = true;
+      // Resume from draft if we have partial answers; otherwise start fresh.
+      const resuming = Object.keys(_profileSetupData).length > 0;
+      if (!resuming) _profileSetupData = {};
+      appendMessage('pixin', resuming
+        ? "Welcome back! Let's finish your setup."
+        : "Hey! Quick setup — 4 taps and I'll know how to help you better.");
+      setTimeout(_resumeProfileSetup, 300);
+    }
+
+    function _resumeProfileSetup() {
+      // Resume at the first unanswered question.
+      if (!_profileSetupData.playStyle) { _showProfileQ1(); return; }
+      if (!_profileSetupData.goal)      { _showProfileQ2(); return; }
+      if (_profileSetupData.goal !== 'everything' && _profileSetupData.goalTarget === undefined) { _showProfileQ2b(); return; }
+      if (_profileSetupData.hasPet === undefined) { _showProfileQ3(); return; }
+      if (!_profileSetupData.storage)   { _showProfileQ4(); return; }
+      if (!_profileSetupData.taskboardMaxPrice) { _showProfileQ5(); return; }
+      _finishProfileSetup(); // all answers present — finish immediately
+    }
+
+    function _showProfileQ1() {
+      _appendMessageWithChoices('pixin', '🎮 How do you play?', [
+        { label: 'Once a day', value: 'once_a_day' },
+        { label: 'Twice a day', value: 'twice_a_day' },
+        { label: 'Whenever I can', value: 'whenever' },
+      ], (val) => { _profileSetupData.playStyle = val; _saveDraft(); _showProfileQ2(); });
+    }
+
+    function _showProfileQ2() {
+      _appendMessageWithChoices('pixin', '🎯 Main goal?', [
+        { label: 'Level up', value: 'level_up' },
+        { label: 'Earn Pixels', value: 'earn_pixels' },
+        { label: 'Earn coins', value: 'earn_coins' },
+        { label: 'A bit of everything', value: 'everything' },
+      ], (val) => {
+        _profileSetupData.goal = val;
+        _saveDraft();
+        if (val !== 'everything') _showProfileQ2b();
+        else _showProfileQ3();
+      });
+    }
+
+    function _showProfileQ2b() {
+      const id = appendMessage('pixin', '🎯 Any specific target? (e.g. "Stoneshaping 50", "1000 Pixels")');
+      const el = document.getElementById(`px-msg-${id}`);
+      if (!el) { _showProfileQ3(); return; }
+      const row = document.createElement('div');
+      row.className = 'px-msg-choices';
+      const inp = document.createElement('input');
+      inp.type = 'text'; inp.className = 'px-profile-input';
+      inp.placeholder = 'Target (optional)'; inp.maxLength = 100;
+      ['keydown','keyup','keypress'].forEach(ev =>
+        inp.addEventListener(ev, e => { e.stopPropagation(); e.stopImmediatePropagation(); }));
+      const finish = (skip) => {
+        if (!skip) { const v = inp.value.trim(); if (v) _profileSetupData.goalTarget = v; }
+        else { _profileSetupData.goalTarget = null; } // mark as explicitly skipped for resume
+        _saveDraft();
+        row.remove(); _showProfileQ3();
+      };
+      const setBtn = document.createElement('button'); setBtn.className = 'px-choice-btn'; setBtn.textContent = 'Set';
+      const skipBtn = document.createElement('button'); skipBtn.className = 'px-choice-btn'; skipBtn.textContent = 'Skip';
+      setBtn.addEventListener('click', () => finish(false));
+      skipBtn.addEventListener('click', () => finish(true));
+      inp.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); finish(false); } });
+      row.appendChild(inp); row.appendChild(setBtn); row.appendChild(skipBtn);
+      el.appendChild(row);
+      const list = document.getElementById('px-messages');
+      if (list) list.scrollTop = list.scrollHeight;
+      setTimeout(() => inp.focus(), 50);
+    }
+
+    function _showProfileQ3() {
+      const ctx = latestPlayerContext;
+      // Auto-detect pets: check hasPet (from selfPlayer.pet) or petAvatar from GPlayerCore.
+      const hasPetAuto = ctx?.hasPet !== null && ctx?.hasPet !== undefined ? ctx.hasPet
+        : (ctx?.petAvatar != null ? true : null);
+      const detectedCount = hasPetAuto === true ? 1 : hasPetAuto === false ? 0 : null;
+      if (hasPetAuto !== null) {
+        _profileSetupData.hasPet = hasPetAuto;
+        _profileSetupData.petCount = detectedCount;
+        _profileSetupData.petNames = ctx?.petNames ?? [];
+        _profileSetupData.petDetected = true;
+        _saveDraft();
+        if (hasPetAuto) {
+          const nameStr = _profileSetupData.petNames.length > 0 ? ` (${_profileSetupData.petNames.join(', ')})` : '';
+          appendMessage('pixin', `🐾 Pets: ${detectedCount} detected${nameStr} — skipping that question!`);
+        }
+        _showProfileQ4(); return;
+      }
+      _appendMessageWithChoices('pixin', '🐾 Do you have a pet?', [
+        { label: 'Yes', value: true },
+        { label: 'No', value: false },
+      ], (val) => { _profileSetupData.hasPet = val; _profileSetupData.petDetected = false; _saveDraft(); _showProfileQ4(); });
+    }
+
+    function _showProfileQ4() {
+      // Auto-detect storage from chest scan: skip question if chests are already known.
+      const ctx = latestPlayerContext;
+      const chestCount = Object.keys(ctx?.storageChests ?? {}).length;
+      if (chestCount > 0) {
+        const storage = chestCount >= 4 ? 'lots' : chestCount >= 2 ? 'some' : 'very_little';
+        _profileSetupData.storage = storage;
+        _profileSetupData.storageDetected = true;
+        _profileSetupData.chestCount = chestCount;
+        _saveDraft();
+        _showProfileQ5(); return;
+      }
+      _appendMessageWithChoices('pixin', '📦 Storage space?', [
+        { label: 'Lots', value: 'lots' },
+        { label: 'Some', value: 'some' },
+        { label: 'Very little', value: 'very_little' },
+      ], (val) => { _profileSetupData.storage = val; _profileSetupData.storageDetected = false; _saveDraft(); _showProfileQ5(); });
+    }
+
+    function _showProfileQ5() {
+      _appendMessageWithChoices('pixin', '📋 Most you\'d pay for one Taskboard order?', [
+        { label: '60,000', value: 60000 },
+        { label: '80,000', value: 80000 },
+        { label: '100,000', value: 100000 },
+        { label: '120,000+', value: 120000 },
+      ], (val) => {
+        _profileSetupData.taskboardMaxPrice = val;
+        _profileSetupData.taskboardTooExpensive = Math.round(val * 1.25 / 10000) * 10000;
+        _saveDraft();
+        _finishProfileSetup();
+      });
+    }
+
+    function _finishProfileSetup() {
+      _profileSetupActive = false;
+      const profile = { ..._profileSetupData, setupAt: Date.now() };
+      playerProfile = profile;
+      _profileSetupData = {};
+      const pid = latestPlayerContext?.playerId;
+      if (pid) {
+        storageSetKey(`playerProfile_${pid}`, profile).catch(e => console.warn(TAG, 'save profile', e));
+        // Clear the draft now that setup is complete
+        storageDeleteKey(`playerProfileDraft_${pid}`).catch(() => {});
+        nbFetch('/api/player-prefs', { method: 'POST', body: JSON.stringify({ playerId: pid, key: 'playerProfile', value: profile }) }).catch(() => {});
+        nbFetch('/api/player-prefs', { method: 'POST', body: JSON.stringify({ playerId: pid, key: 'playerProfileDraft', value: null }) }).catch(() => {});
+      }
+      appendMessage('pixin', '✅ All set! Update it anytime in Diary → My profile.');
+      renderProfileTab();
+    }
+
+    async function _loadProfileForPlayer(pid) {
+      try {
+        const [profile, draft, hhSeason, nowDoing] = await Promise.all([
+          storageGetKey(`playerProfile_${pid}`),
+          storageGetKey(`playerProfileDraft_${pid}`),
+          storageGetKey(`hearthHallSeason_${pid}`),
+          storageGetKey(`nowDoing_${pid}`),
+        ]);
+        if (profile) playerProfile = profile;
+        if (draft && !profile) _profileSetupData = draft; // resume draft if no completed profile
+        if (hhSeason) hearthHallSeasonStart = hhSeason;
+        if (nowDoing) { nowDoingNote = nowDoing.note ?? ''; nowDoingSetAt = nowDoing.setAt ?? 0; }
+        renderProfileTab();
+      } catch (e) { console.warn(TAG, '_loadProfileForPlayer', e); }
+      // Load prefs from backend so intro flags + profile survive reinstall.
+      // _loadPlayerPrefsFromBackend sets _profileBackendLoaded and calls _maybeStartSetupOrBrief.
+      _loadPlayerPrefsFromBackend(pid).catch(() => { _profileBackendLoaded = true; _maybeStartSetupOrBrief(); });
+    }
+
+    async function _loadPlayerPrefsFromBackend(pid) {
+      try {
+        const resp = await nbFetch(`/api/player-prefs?playerId=${encodeURIComponent(pid)}`);
+        if (!resp.ok) { _profileBackendLoaded = true; _maybeStartSetupOrBrief(); return; }
+        const prefs = await resp.json();
+        // Intro flags — set in-memory + local cache if backend says seen
+        if (prefs.hasSeenIntro       && !introSeen)       { introSeen       = true; storageSetKey('hasSeenIntro', true).catch(() => {}); }
+        if (prefs.hasSeenRoyagiIntro && !royagiIntroSeen) { royagiIntroSeen = true; storageSetKey('hasSeenRoyagiIntro', true).catch(() => {}); }
+        if (prefs.hasSeenNyankoIntro && !nyankoIntroSeen) { nyankoIntroSeen = true; storageSetKey('hasSeenNyankoIntro', true).catch(() => {}); }
+        // Profile — backend wins if no local profile; else keep local (it may be newer)
+        if (prefs.playerProfile && !playerProfile) {
+          playerProfile = prefs.playerProfile;
+          storageSetKey(`playerProfile_${pid}`, playerProfile).catch(() => {});
+          renderProfileTab();
+        }
+        // Draft — resume an abandoned setup
+        if (prefs.playerProfileDraft && !playerProfile && !_profileSetupActive) {
+          _profileSetupData = prefs.playerProfileDraft;
+          storageSetKey(`playerProfileDraft_${pid}`, _profileSetupData).catch(() => {});
+        }
+        // XP baseline — merge backend into local (local wins on a per-day conflict since it's more recent)
+        if (prefs.xpBaseline) {
+          const local = (await storageGetKey(`xpBaseline_${pid}`)) ?? {};
+          const merged = { ...prefs.xpBaseline, ...local }; // local wins per-day
+          const keys = Object.keys(merged).sort();
+          while (keys.length > 7) delete merged[keys.shift()];
+          await storageSetKey(`xpBaseline_${pid}`, merged);
+        }
+      } catch (_) { /* offline — fine, use local cache */ }
+      _profileBackendLoaded = true;
+      _maybeStartSetupOrBrief();
+    }
+
+    function renderProfileTab() {
+      const el = document.getElementById('px-nb-profile-content');
+      if (!el) return;
+      if (!playerProfile) { el.textContent = 'No profile yet — tap "Update profile" to set one up.'; return; }
+      const p = playerProfile;
+      const psMap = { once_a_day: 'Once a day', twice_a_day: 'Twice a day', whenever: 'Whenever I can' };
+      const glMap = { level_up: 'Level up', earn_pixels: 'Earn Pixels', earn_coins: 'Earn coins', everything: 'A bit of everything' };
+      const stMap = { lots: 'Lots', some: 'Some', very_little: 'Very little' };
+      // Pet display: show detected count and names when auto-detected
+      let petLine;
+      if (p.petDetected && p.petCount != null) {
+        const nameStr = Array.isArray(p.petNames) && p.petNames.length > 0
+          ? ` (${p.petNames.join(', ')})` : '';
+        petLine = `Pets: ${p.petCount} (detected${nameStr})`;
+      } else {
+        petLine = `Pet: ${p.hasPet === true ? 'Yes' : p.hasPet === false ? 'No' : '—'}`;
+      }
+      // Storage display: show detected chest count when auto-detected
+      const storageSrc = p.storageDetected && p.chestCount != null
+        ? `${stMap[p.storage] ?? p.storage} (${p.chestCount} chests detected)`
+        : (stMap[p.storage] ?? p.storage ?? '—');
+      el.textContent = [
+        `Play style: ${psMap[p.playStyle] ?? p.playStyle ?? '—'}`,
+        `Goal: ${glMap[p.goal] ?? p.goal ?? '—'}${p.goalTarget ? ` — ${p.goalTarget}` : ''}`,
+        petLine,
+        `Storage: ${storageSrc}`,
+        `Taskboard max: ${p.taskboardMaxPrice?.toLocaleString?.() ?? '—'} coins`,
+        `Too pricey above: ${p.taskboardTooExpensive?.toLocaleString?.() ?? '—'} coins`,
+      ].join('\n');
+    }
+
+    // ---- Morning brief -------------------------------------------------------
+
+    function _utcDateStr() {
+      const d = new Date();
+      return `${d.getUTCFullYear()}-${String(d.getUTCMonth()+1).padStart(2,'0')}-${String(d.getUTCDate()).padStart(2,'0')}`;
+    }
+
+    async function checkMorningBrief() {
+      const pid = latestPlayerContext?.playerId;
+      if (!pid || !playerProfile) return;
+      const today = _utcDateStr();
+      // In-memory guard prevents race condition when called twice before the async storage read resolves
+      if (_briefShownDate === today) return;
+      _briefShownDate = today;
+      const key = `morningBriefDate_${pid}`;
+      const last = await storageGetKey(key);
+      if (last === today) return;
+      await storageSetKey(key, today);
+      showMorningBrief(false);
+    }
+
+    function showMorningBrief(force) {
+      const lines = _buildMorningBriefLines();
+      if (!lines || lines.length === 0) return;
+      const id = appendMessage('pixin', lines.join('\n'));
+      const el = document.getElementById(`px-msg-${id}`);
+      if (!el) return;
+      el.style.whiteSpace = 'pre-line';
+      const row = document.createElement('div');
+      row.className = 'px-msg-choices';
+      const moreBtn = document.createElement('button');
+      moreBtn.className = 'px-choice-btn'; moreBtn.textContent = 'More';
+      moreBtn.addEventListener('click', () => { row.remove(); openNotebook('diary'); });
+      const gotItBtn = document.createElement('button');
+      gotItBtn.className = 'px-choice-btn'; gotItBtn.textContent = 'Got it';
+      gotItBtn.addEventListener('click', () => { row.remove(); el.style.opacity = '0.7'; });
+      row.appendChild(moreBtn); row.appendChild(gotItBtn);
+      el.appendChild(row);
+      const list = document.getElementById('px-messages');
+      if (list) list.scrollTop = list.scrollHeight;
+    }
+
+    function _buildMorningBriefLines() {
+      const ctx = latestPlayerContext;
+      const lines = [];
+
+      // ✅ Ready activity timers — grouped by place
+      const timers = ctx?.activityTimers;
+      if (Array.isArray(timers) && timers.length > 0) {
+        const ready = timers.filter(t => t.readyAt && t.readyAt <= Date.now());
+        if (ready.length > 0) {
+          const byPlace = {};
+          for (const t of ready) {
+            const place = t.landLabel ?? t.mapId ?? 'elsewhere';
+            (byPlace[place] = byPlace[place] ?? []).push(t.itemLabel ?? t.entityLabel ?? 'timer');
+          }
+          const parts = Object.entries(byPlace).map(([pl, items]) => `${items.join(', ')} (${pl})`);
+          lines.push(`✅ Ready: ${parts.join('; ')}`);
+        }
+      }
+
+      // 🎁 Free Post Office parcel (daily reminder)
+      lines.push('🎁 Free Post Office parcel available');
+
+      // 🐾 Pet Shop gift — only if player has a pet
+      if (playerProfile?.hasPet) lines.push('🐾 Pet Shop gift ready');
+
+      // 🎮 Neon Zone day
+      const dow = new Date().getUTCDay();
+      if (dow === 1) lines.push('🎮 New Neon Zone week started');
+      else if (dow === 0) lines.push('🎮 Last day of Neon Zone week');
+
+      // 🔥 New Hearth Hall season (if detected within last 7 days)
+      if (hearthHallSeasonStart && Date.now() - hearthHallSeasonStart < 7 * 86_400_000) {
+        lines.push('🔥 New Hearth Hall season has started');
+      }
+
+      // 🎯 Goal progress
+      const goalLine = _buildGoalProgressLine();
+      if (goalLine) lines.push(goalLine);
+
+      // 📋 Stacked App offers
+      const stacked = ctx?.stackedOffers;
+      if (Array.isArray(stacked) && stacked.length > 0) {
+        const soonest = stacked.reduce((a, b) => {
+          const aExp = a.expiresAt ?? Infinity;
+          const bExp = b.expiresAt ?? Infinity;
+          return bExp < aExp ? b : a;
+        }, stacked[0]);
+        if (soonest) {
+          const count = stacked.length;
+          const leftMs = soonest.expiresAt ? soonest.expiresAt - Date.now() : null;
+          const timeStr = leftMs !== null && leftMs > 0
+            ? leftMs < 3_600_000
+              ? `${Math.round(leftMs / 60_000)}m`
+              : (() => { const h = Math.floor(leftMs / 3_600_000); const m = Math.floor((leftMs % 3_600_000) / 60_000); return m > 0 ? `${h}h ${m}m` : `${h}h`; })()
+            : null;
+          lines.push(`📋 Stacked: ${count} offer${count !== 1 ? 's' : ''}${timeStr !== null ? `, next ends in ${timeStr}` : ''}`);
+        }
+      }
+
+      // 📉 Taskboard pricey warning
+      const taskboard = ctx?.taskboard;
+      const tooExp = playerProfile?.taskboardTooExpensive ?? 100_000;
+      if (Array.isArray(taskboard) && taskboard.length > 1) {
+        const pricey = taskboard.filter(o => ((o.marketPrice ?? o.price ?? 0) * (o.quantity ?? 1)) > tooExp);
+        if (pricey.length > taskboard.length / 2) {
+          lines.push("📉 Taskboard's pricey today — level skills instead");
+        }
+      }
+
+      // Always last
+      lines.push('Open your Taskboard + Stacked and I\'ll plan today 👇');
+      return lines.slice(0, 8);
+    }
+
+    function _buildGoalProgressLine() {
+      const target = playerProfile?.goalTarget;
+      if (!target) return null;
+      const ctx = latestPlayerContext;
+      const skills = ctx?.skills;
+      if (!skills || typeof skills !== 'object') return null;
+      const m = target.match(/^(.+?)\s+(\d+)$/);
+      if (!m) return null;
+      const needle = m[1].toLowerCase().replace(/[^a-z]/g, '');
+      const targetLv = parseInt(m[2]);
+      const key = Object.keys(skills).find(k => k.toLowerCase().replace(/[^a-z]/g, '') === needle);
+      if (!key) return null;
+      const lv = skills[key]?.level ?? 0;
+      if (lv >= targetLv) return `🎯 Goal "${m[1]} ${targetLv}" — done! 🎉`;
+      return `🎯 ${m[1]}: level ${lv}/${targetLv}`;
+    }
+
+    // ---- "What was I doing?" -------------------------------------------------
+
+    function showWhatWasDoing() {
+      if (isBusy) return;
+      const ctx = latestPlayerContext;
+      const parts = [];
+
+      if (playerProfile?.goal && playerProfile.goal !== 'everything') {
+        const glMap = { level_up: 'Level up', earn_pixels: 'Earn Pixels', earn_coins: 'Earn coins' };
+        parts.push(`🎯 Goal: ${glMap[playerProfile.goal] ?? playerProfile.goal}${playerProfile.goalTarget ? ` — ${playerProfile.goalTarget}` : ''}`);
+      }
+
+      const timers = ctx?.activityTimers;
+      if (Array.isArray(timers) && timers.length > 0) {
+        const latest = timers.reduce((a, b) => ((b.startedAt ?? 0) > (a.startedAt ?? 0) ? b : a), timers[0]);
+        if (latest) {
+          parts.push(`⏱️ Last started: ${latest.itemLabel ?? latest.entityLabel ?? 'activity'} (${latest.landLabel ?? latest.mapId ?? 'somewhere'})`);
+        }
+      }
+
+      const active = nowDoingNote && (Date.now() - nowDoingSetAt) < 2 * 3_600_000 ? nowDoingNote : null;
+      if (active) parts.push(`📌 Doing: ${active}`);
+
+      if (parts.length === 0) parts.push('Nothing tracked yet — set a note below!');
+
+      const id = appendMessage('pixin', parts.join('\n'));
+      const el = document.getElementById(`px-msg-${id}`);
+      if (!el) return;
+      el.style.whiteSpace = 'pre-line';
+
+      const row = document.createElement('div');
+      row.className = 'px-msg-choices';
+      const inp = document.createElement('input');
+      inp.type = 'text'; inp.className = 'px-profile-input';
+      inp.placeholder = 'Now doing… (clears after 2h)'; inp.maxLength = 150;
+      inp.value = nowDoingNote || '';
+      ['keydown','keyup','keypress'].forEach(ev =>
+        inp.addEventListener(ev, e => { e.stopPropagation(); e.stopImmediatePropagation(); }));
+      const doSet = () => {
+        const val = inp.value.trim();
+        nowDoingNote = val; nowDoingSetAt = val ? Date.now() : 0; nowDoingLastRemindedMap = null;
+        const pid = latestPlayerContext?.playerId;
+        if (pid) storageSetKey(`nowDoing_${pid}`, { note: val, setAt: nowDoingSetAt }).catch(() => {});
+        row.remove();
+        appendMessage('pixin', val ? `📌 Got it: "${val}"` : '📌 Note cleared.');
+      };
+      const setBtn = document.createElement('button'); setBtn.className = 'px-choice-btn'; setBtn.textContent = 'Set note';
+      const clrBtn = document.createElement('button'); clrBtn.className = 'px-choice-btn'; clrBtn.textContent = 'Clear';
+      setBtn.addEventListener('click', doSet);
+      clrBtn.addEventListener('click', () => { inp.value = ''; doSet(); });
+      inp.addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); doSet(); } });
+      row.appendChild(inp); row.appendChild(setBtn); row.appendChild(clrBtn);
+      el.appendChild(row);
+      const list = document.getElementById('px-messages');
+      if (list) list.scrollTop = list.scrollHeight;
+      setTimeout(() => inp.focus(), 50);
     }
 
     // ---- Init ----------------------------------------------------------------
@@ -1846,12 +2644,269 @@
       if (timerCountdownInterval) { clearInterval(timerCountdownInterval); timerCountdownInterval = null; }
     }
 
-    function openNotebook() {
+    // ---- Storage pop-up -------------------------------------------------------
+
+    async function _loadStorageMeta() {
+      if (_storageMeta) return _storageMeta;
+      if (_storageMetaLoading) return null;
+      _storageMetaLoading = true;
+      try {
+        const res = await fetch(`${BACKEND_URL}/api/items-meta`);
+        if (res.ok) _storageMeta = await res.json();
+      } catch (_) {}
+      _storageMetaLoading = false;
+      return _storageMeta;
+    }
+
+    function _stParseMapLabel(mapId) {
+      if (!mapId) return { label: 'Location not seen yet', sort: 99 };
+      if (mapId.startsWith('shareInterior')) {
+        const suffix = mapId.slice('shareInterior'.length);
+        const nft = suffix.match(/^pixelsNFTFarm-?(\d+)/);
+        if (nft) return { label: `Land ${nft[1]} — inside`, sort: 20 + parseInt(nft[1], 10) };
+        return { label: 'Speck — inside', sort: 1 };
+      }
+      if (mapId.startsWith('shareRent')) return { label: 'Speck — outside', sort: 0 };
+      const nftMatch = mapId.match(/^pixelsNFTFarm-?(\d+)/);
+      if (nftMatch) return { label: `Land ${nftMatch[1]} — outside`, sort: 10 + parseInt(nftMatch[1], 10) };
+      return { label: mapId, sort: 50 };
+    }
+
+    function _stTimeAgo(ms) {
+      if (!ms) return 'unknown';
+      const s = Math.floor((Date.now() - ms) / 1000);
+      if (s < 5) return 'just now';
+      if (s < 60) return `${s}s ago`;
+      if (s < 3600) return `${Math.floor(s / 60)}m ago`;
+      return `${Math.floor(s / 3600)}h ago`;
+    }
+
+    function _stEsc(str) {
+      return String(str ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    function _stIcon(itemId, meta, cls) {
+      const info = meta?.[itemId];
+      if (info?.imageUrl) {
+        return `<img class="${cls}" src="${_stEsc(info.imageUrl)}" alt="" loading="lazy" onerror="this.style.display='none'">`;
+      }
+      return `<div class="${cls}-ph">?</div>`;
+    }
+
+    // Build a grid tile as a DOM element with inline styles (immune to game CSS overrides).
+    function _stTileEl(id, qty, meta) {
+      const tile = document.createElement('div');
+      tile.title = _stName(id, meta);
+      tile.style.cssText = 'position:relative;width:46px;height:46px;flex:0 0 46px;display:flex;align-items:center;justify-content:center;background:#f3ead8;border-radius:4px;overflow:visible;box-sizing:border-box;cursor:default;';
+      tile.addEventListener('mouseenter', () => { tile.style.background = '#e8dfc8'; });
+      tile.addEventListener('mouseleave', () => { tile.style.background = '#f3ead8'; });
+      const info = meta?.[id];
+      if (info?.imageUrl) {
+        const img = document.createElement('img');
+        img.src = info.imageUrl;
+        img.alt = '';
+        img.loading = 'lazy';
+        img.style.cssText = 'max-width:40px;max-height:40px;image-rendering:pixelated;display:block;';
+        img.onerror = function() {
+          console.log('[px-storage] icon load failed:', id, info.imageUrl);
+          this.style.display = 'none';
+          // Replace with initials fallback
+          const fb = document.createElement('div');
+          const fbName = info?.name ?? id.replace(/^itm_/, '').replace(/_/g, ' ');
+          const initials = fbName.split(/\s+/).slice(0, 2).map(w => (w[0] ?? '').toUpperCase()).join('');
+          console.log('[px-storage] initials fallback:', id, 'name:', fbName, 'initials:', initials);
+          fb.style.cssText = 'width:34px;height:34px;background:#e0d8c8;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:11px;color:#888;font-weight:600;';
+          fb.textContent = initials || '?';
+          tile.insertBefore(fb, this.nextSibling || null);
+        };
+        tile.appendChild(img);
+      } else {
+        if (id) console.log('[px-storage] no imageUrl for item:', id, 'meta entry:', !!info);
+        const ph = document.createElement('div');
+        const phName = info?.name ?? meta?.[id]?.name ?? id.replace(/^itm_/, '').replace(/_/g, ' ');
+        const initials = phName.split(/\s+/).slice(0, 2).map(w => (w[0] ?? '').toUpperCase()).join('');
+        console.log('[px-storage] initials fallback:', id, 'name:', phName, 'initials:', initials);
+        ph.style.cssText = 'width:34px;height:34px;background:#e0d8c8;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:11px;color:#888;font-weight:600;';
+        ph.textContent = initials || '?';
+        tile.appendChild(ph);
+      }
+      const badge = document.createElement('span');
+      badge.style.cssText = 'position:absolute;right:2px;bottom:1px;font-size:10px;padding:0 3px;background:rgba(0,0,0,0.6);color:#fff;border-radius:3px;line-height:13px;pointer-events:none;';
+      badge.textContent = `\xd7${qty}`;
+      tile.appendChild(badge);
+      return tile;
+    }
+
+    function _stName(itemId, meta) {
+      return meta?.[itemId]?.name ?? itemId;
+    }
+
+    function openStorageModal() {
+      storageOpen = true;
+      document.getElementById('px-storage-modal').classList.add('px-modal-visible');
+      _renderStorage();
+    }
+
+    function closeStorageModal() {
+      storageOpen = false;
+      document.getElementById('px-storage-modal').classList.remove('px-modal-visible');
+    }
+
+    async function _renderStorage() {
+      const content = document.getElementById('px-storage-content');
+      if (!content) return;
+      content.innerHTML = '<div style="padding:12px;font-size:8px;color:#888;font-family:inherit">Loading…</div>';
+
+      const meta = await _loadStorageMeta();
+      if (!document.getElementById('px-storage-modal')?.classList.contains('px-modal-visible')) return;
+
+      const ctx     = latestPlayerContext ?? {};
+      const chests  = ctx.storageChests ?? {};
+      const inv     = ctx.inventory ?? {};
+      const rawSearch = document.getElementById('px-storage-search')?.value ?? '';
+      const search  = rawSearch.trim().toLowerCase();
+
+      if (_storageMode === 'totals') {
+        _renderStorageTotals(content, chests, inv, meta, search);
+      } else {
+        _renderStorageBrowse(content, chests, inv, meta, search);
+      }
+    }
+
+    function _renderStorageBrowse(content, chests, inv, meta, search) {
+      content.innerHTML = '';
+      const rawSearch = document.getElementById('px-storage-search')?.value ?? '';
+      const GRID_STYLE = 'display:flex;flex-wrap:wrap;gap:4px;align-items:flex-start;margin-top:5px;';
+      let hasContent = false;
+
+      function makeSection(labelHtml, countHtml, entries) {
+        const wrap = document.createElement('div');
+        wrap.innerHTML = `<div class=”px-st-section-hdr”><span>${labelHtml}</span><span class=”px-st-section-count”>${countHtml}</span></div>`;
+        const grid = document.createElement('div');
+        grid.style.cssText = GRID_STYLE;
+        if (entries.length > 0) {
+          for (const [id, qty] of entries) grid.appendChild(_stTileEl(id, qty, meta));
+        } else {
+          const empty = document.createElement('div');
+          empty.className = 'px-st-chest-empty';
+          empty.textContent = search ? 'No matches' : 'Empty';
+          grid.appendChild(empty);
+        }
+        wrap.appendChild(grid);
+        return wrap;
+      }
+
+      // Backpack — sorted by qty desc
+      const bpEntries = Object.entries(inv)
+        .filter(([id, qty]) => qty > 0 && (!search || _stName(id, meta).toLowerCase().includes(search)))
+        .sort((a, b) => b[1] - a[1]);
+      const bpTotal = bpEntries.reduce((s, [, q]) => s + q, 0);
+      if (!search || bpEntries.length > 0) {
+        content.appendChild(makeSection(
+          'Backpack',
+          `${bpEntries.length} types \xb7 ${bpTotal} items`,
+          bpEntries
+        ));
+        hasContent = true;
+      }
+
+      // Group chests by location; merge items across all chests in each location
+      const byLoc = {};
+      for (const [, chest] of Object.entries(chests)) {
+        const { label, sort } = _stParseMapLabel(chest.landId);
+        if (!byLoc[label]) byLoc[label] = { sort, chestCount: 0, merged: {}, newestAt: 0 };
+        byLoc[label].chestCount++;
+        byLoc[label].newestAt = Math.max(byLoc[label].newestAt, chest.capturedAt ?? 0);
+        for (const { itemId, qty } of chest.items) {
+          byLoc[label].merged[itemId] = (byLoc[label].merged[itemId] ?? 0) + qty;
+        }
+      }
+      const sortedLocs = Object.entries(byLoc).sort((a, b) => a[1].sort - b[1].sort || a[0].localeCompare(b[0]));
+
+      for (const [locLabel, { chestCount, merged, newestAt }] of sortedLocs) {
+        let locItems = Object.entries(merged).filter(([, q]) => q > 0);
+        if (search) locItems = locItems.filter(([id]) => _stName(id, meta).toLowerCase().includes(search));
+        if (search && locItems.length === 0) continue;
+        locItems.sort((a, b) => b[1] - a[1]);
+        const locTotal = Object.values(merged).reduce((s, q) => s + q, 0);
+        content.appendChild(makeSection(
+          _stEsc(locLabel),
+          `${chestCount} chest${chestCount !== 1 ? 's' : ''} \xb7 ${locTotal} items \xb7 ${_stTimeAgo(newestAt)}`,
+          locItems
+        ));
+        hasContent = true;
+      }
+
+      if (!hasContent) {
+        const empty = document.createElement('div');
+        empty.className = 'px-st-empty';
+        empty.textContent = 'No storage data yet — visit your lands to load chests.';
+        content.appendChild(empty);
+        return;
+      }
+
+      if (search) {
+        const totalQty = bpEntries.reduce((s, [, q]) => s + q, 0)
+          + Object.values(chests).reduce((s, c) =>
+            s + c.items.filter(i => _stName(i.itemId, meta).toLowerCase().includes(search)).reduce((a, i) => a + i.qty, 0), 0);
+        const summary = document.createElement('div');
+        summary.className = 'px-st-search-summary';
+        summary.textContent = `”${rawSearch.trim()}” — ${totalQty} total across all storage`;
+        content.insertBefore(summary, content.firstChild);
+      }
+    }
+
+    function _renderStorageTotals(content, chests, inv, meta, search) {
+      const totals = {};
+      const addItem = (id, qty, source) => {
+        if (!totals[id]) totals[id] = { qty: 0, sources: [] };
+        totals[id].qty += qty;
+        totals[id].sources.push(source);
+      };
+
+      for (const [id, qty] of Object.entries(inv)) {
+        if (qty > 0) addItem(id, qty, 'Backpack');
+      }
+      for (const [, chest] of Object.entries(chests)) {
+        const { label } = _stParseMapLabel(chest.landId);
+        for (const { itemId, qty } of chest.items) {
+          addItem(itemId, qty, label);
+        }
+      }
+
+      let entries = Object.entries(totals)
+        .filter(([, t]) => t.qty > 0)
+        .sort((a, b) => _stName(a[0], meta).localeCompare(_stName(b[0], meta)));
+
+      if (search) entries = entries.filter(([id]) => _stName(id, meta).toLowerCase().includes(search));
+
+      if (entries.length === 0) {
+        content.innerHTML = `<div class="px-st-empty">${search ? 'No items match.' : 'No storage data yet.'}</div>`;
+        return;
+      }
+
+      content.innerHTML = entries.map(([id, { qty, sources }]) => {
+        const name = _stName(id, meta);
+        const uniqSrc = [...new Set(sources)].join(', ');
+        return `<div class="px-st-totals-row">
+          ${_stIcon(id, meta, 'px-st-totals-icon')}
+          <span class="px-st-totals-name" title="${_stEsc(name)}">${_stEsc(name)}</span>
+          <span class="px-st-totals-qty">\xd7${qty}</span>
+          <span class="px-st-totals-detail" title="${_stEsc(uniqSrc)}">${_stEsc(uniqSrc)}</span>
+        </div>`;
+      }).join('');
+    }
+
+    // ---- Notebook / Diary modal -----------------------------------------------
+
+    function openNotebook(tab) {
       notebookOpen = true;
+      if (tab) switchNotebookTab(tab);
       document.getElementById('px-notebook-modal').classList.add('px-modal-visible');
       diaryPage = 1;
       if (notebookTab === 'diary') { loadDiary(1); renderTodayXp(); }
       else if (notebookTab === 'timers') loadActivityTimers();
+      else if (notebookTab === 'profile') renderProfileTab();
       else loadNotebook();
       startTimerCountdown();
     }
@@ -1863,15 +2918,17 @@
     }
 
     function switchNotebookTab(tab) {
-      if (tab !== 'diary' && tab !== 'notebook' && tab !== 'timers') return;
+      if (!['diary','notebook','timers','profile'].includes(tab)) return;
       notebookTab = tab;
       document.querySelectorAll('.px-nb-tab').forEach(btn =>
         btn.classList.toggle('px-nb-tab-active', btn.dataset.tab === tab));
       document.getElementById('px-nb-diary-panel').classList.toggle('px-nb-panel-active', tab === 'diary');
       document.getElementById('px-nb-notebook-panel').classList.toggle('px-nb-panel-active', tab === 'notebook');
       document.getElementById('px-nb-act-timers-panel').classList.toggle('px-nb-panel-active', tab === 'timers');
+      document.getElementById('px-nb-profile-panel').classList.toggle('px-nb-panel-active', tab === 'profile');
       if (tab === 'diary') { diaryPage = 1; loadDiary(1); renderTodayXp(); }
       else if (tab === 'timers') { loadActivityTimers(); loadNotebook(); }
+      else if (tab === 'profile') renderProfileTab();
       else loadNotebook();
     }
 
@@ -2079,6 +3136,7 @@
           delete baselines[keys.shift()];
         }
         await storageSetKey(storageKey, baselines);
+        nbFetch('/api/player-prefs', { method: 'POST', body: JSON.stringify({ playerId, key: 'xpBaseline', value: baselines }) }).catch(() => {});
       }
     }
 
@@ -2561,6 +3619,157 @@
       if (notebookOpen && notebookTab === 'diary') {
         renderTodayXp();
       }
+      // Live-refresh storage modal if open
+      if (storageOpen) {
+        _renderStorage();
+      }
+      // Load profile once per player session
+      if (!profileLoaded && data?.playerId) {
+        profileLoaded = true;
+        _loadProfileForPlayer(data.playerId);
+      }
+      // Post-brief plan: once taskboard + stacked both have data, post a short plan once per day
+      _maybePlanAfterBrief(data);
+    }
+
+    async function _maybePlanAfterBrief(data) {
+      const pid = data?.playerId;
+      if (!pid || !playerProfile) return;
+      const today = _utcDateStr();
+      if (_briefPlanPostedDate === today) return;
+
+      const hasTb = Array.isArray(data?.taskboard) && data.taskboard.length > 0;
+      const hasSt = Array.isArray(data?.stackedOffers) && data.stackedOffers.length > 0;
+      if (!hasTb || !hasSt) return;
+
+      // Only fire if the brief was shown today
+      let briefDate = null;
+      try { briefDate = await storageGetKey(`morningBriefDate_${pid}`); } catch { return; }
+      if (briefDate !== today) return;
+
+      // Mark before async work to prevent double-fire
+      _briefPlanPostedDate = today;
+
+      // Build a short local plan from available data
+      const lines = _buildBriefPlan(data);
+      if (lines && lines.length > 0) {
+        appendMessage(currentPersona, lines.join('\n'));
+        const list = document.getElementById('px-messages');
+        if (list) list.scrollTop = list.scrollHeight;
+      }
+    }
+
+    function _buildBriefPlan(ctx) {
+      const lines = [];
+      const taskboard = ctx?.taskboard ?? [];
+      const stacked   = ctx?.stackedOffers ?? [];
+      const inv       = ctx?.inventory ?? {};
+      const maxPrice  = playerProfile?.taskboardTooExpensive ?? 100_000;
+      const marketPrices = ctx?.marketPrices ?? {};
+
+      // Parse "12K" / "1,234" style coin strings to number
+      function parseCoins(s) {
+        if (typeof s === 'number') return s;
+        if (!s) return null;
+        const m = String(s).replace(/,/g, '').trim().match(/^(\d+(?:\.\d+)?)([Kk]?)$/);
+        if (!m) return null;
+        const n = parseFloat(m[1]);
+        return isNaN(n) ? null : m[2] ? Math.round(n * 1000) : Math.round(n);
+      }
+
+      // Collect taskboard skill keywords for overlap detection
+      const taskboardSkills = new Set();
+      const SKILL_KWORDS = ['farming','mining','forestry','cooking','crafting','stoneshaping','fishing','woodwork','metalwork','building','tailoring','brewing','petcare','exploration'];
+      for (const o of taskboard) {
+        const label = (o.itemName ?? o.label ?? '').toLowerCase();
+        for (const sk of SKILL_KWORDS) { if (label.includes(sk)) taskboardSkills.add(sk); }
+      }
+      const focuses = taskboardSkills.size > 0 ? taskboardSkills : null;
+
+      // Yieldstone item IDs by union faction (1=Wildgroves/Verdant, 2=Seedwrights/Flint, 3=Reapers/Hollow)
+      const UNION_YIELDSTONES = {
+        1: ['itm_yield_1_1','itm_yield_1_2','itm_yield_1_3','itm_yield_1_4','itm_yield_1_5'],
+        2: ['itm_yield_3_1','itm_yield_3_2','itm_yield_3_3','itm_yield_3_4','itm_yield_3_5'],
+        3: ['itm_yield_6_1','itm_yield_6_2','itm_yield_6_3','itm_yield_6_4','itm_yield_6_5'],
+      };
+      const factionId = typeof ctx?.factionId === 'number' ? ctx.factionId : null;
+      // Sabotage items = yieldstones of the OTHER two unions
+      const saboItemIds = factionId
+        ? Object.entries(UNION_YIELDSTONES).filter(([fid]) => Number(fid) !== factionId).flatMap(([, ids]) => ids)
+        : [];
+      const sabotageCount = saboItemIds.reduce((sum, id) => sum + (typeof inv[id] === 'number' ? inv[id] : 0), 0);
+
+      // Pick best stacked offer — prefer one whose description overlaps taskboard skills; skip sabotage unless player has enough
+      const now = Date.now();
+      const liveOffers = stacked.filter(o => typeof o.expiresAt !== 'number' || o.expiresAt > now);
+      const nonSabotage = liveOffers.filter(o => {
+        const text = (o.requirementText ?? o.description ?? '').toLowerCase();
+        if (!text.includes('sabotage')) return true;
+        // Only include sabotage offer if player holds >= required sabotage yieldstones
+        const saboMatch = text.match(/sabotage\s+(?:enemy\s+unions?|unions?)\s+(\d+)\s+times?/);
+        const required = saboMatch ? parseInt(saboMatch[1], 10) : 1;
+        return sabotageCount >= required;
+      });
+
+      // Prefer offers that overlap taskboard focus skills
+      let bestOffer = null;
+      if (focuses && focuses.size > 0) {
+        bestOffer = nonSabotage.find(o => {
+          const text = (o.requirementText ?? o.description ?? '').toLowerCase();
+          return [...focuses].some(sk => text.includes(sk));
+        }) ?? null;
+      }
+      if (!bestOffer && nonSabotage.length > 0) {
+        bestOffer = nonSabotage.reduce((a, b) => ((a.expiresAt ?? Infinity) < (b.expiresAt ?? Infinity) ? a : b));
+      }
+
+      if (bestOffer) {
+        const req = bestOffer.requirementText ?? bestOffer.description ?? 'Stacked offer';
+        const leftMs = bestOffer.expiresAt ? bestOffer.expiresAt - now : null;
+        const timeStr = leftMs !== null && leftMs > 0
+          ? leftMs < 3_600_000
+            ? `${Math.round(leftMs / 60_000)}m`
+            : (() => { const h = Math.floor(leftMs / 3_600_000); const m = Math.floor((leftMs % 3_600_000) / 60_000); return m > 0 ? `${h}h ${m}m` : `${h}h`; })()
+          : null;
+        lines.push(`📋 ${req}${timeStr ? ` (${timeStr} left)` : ''}`);
+      }
+
+      // Rank taskboard orders by net coin value; show top 2
+      const ranked = taskboard.map(o => {
+        const qty = o.quantityNeeded ?? 1;
+        const costs = Array.isArray(o.costs) ? o.costs : [];
+        const coinReward = costs.length >= 2 ? parseCoins(costs[1]) : null;
+        const have = (inv[o.itemId] ?? 0);
+        const stillNeed = Math.max(0, qty - have);
+        const mp = marketPrices[o.itemId];
+        const fillCost = stillNeed > 0 && mp ? stillNeed * mp.lowestPrice : (stillNeed === 0 ? 0 : null);
+        const netVal = coinReward !== null && fillCost !== null ? coinReward - fillCost : coinReward ?? -Infinity;
+        const affordable2 = fillCost !== null ? fillCost <= maxPrice : true;
+        return { o, qty, have, fillCost, coinReward, netVal, affordable2 };
+      }).filter(r => r.affordable2).sort((a, b) => (b.netVal ?? -Infinity) - (a.netVal ?? -Infinity)).slice(0, 2);
+
+      for (const { o, qty, have, fillCost, coinReward } of ranked) {
+        const name = o.itemName ?? 'Unknown';
+        const status = have >= qty ? '✓ ready' : `${have}/${qty}`;
+        const costStr = fillCost !== null && fillCost > 0 ? ` · costs ~${fillCost.toLocaleString()}` : '';
+        const payStr  = coinReward !== null ? ` · pays ${coinReward.toLocaleString()}` : '';
+        lines.push(`📦 ${name} ×${qty} — ${status}${costStr}${payStr}`);
+      }
+
+      // Suggest focus skill (weakest)
+      const skills = ctx?.skills ?? ctx?.levels ?? {};
+      const FOCUS_SKILLS = ['brewing','tailoring','fishing','exploration','cooking','crafting','building'];
+      let weakestSkill = null;
+      let weakestLevel = Infinity;
+      for (const sk of FOCUS_SKILLS) {
+        const lv = typeof skills[sk] === 'number' ? skills[sk] : (skills[sk]?.level ?? null);
+        if (lv !== null && lv < weakestLevel) { weakestLevel = lv; weakestSkill = sk; }
+      }
+      if (weakestSkill) {
+        lines.push(`🎯 Focus skill: ${weakestSkill.charAt(0).toUpperCase() + weakestSkill.slice(1)} (level ${weakestLevel})`);
+      }
+
+      return lines.slice(0, 5);
     }
 
     return {

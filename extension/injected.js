@@ -238,7 +238,7 @@
       const rewardItems    = [...card.querySelectorAll('[class*="reward"] img[aria-label], [class*="Reward"] img[aria-label]')]
         .map(el => el.getAttribute('aria-label'))
         .filter(Boolean);
-      return { itemName, tier, quantityNeeded, costs, rewardItems, isVipLocked, canDeliverNow };
+      return { itemName, tier, quantityNeeded, costs, rewardItems, isVipLocked, canDeliverNow, itemId: _findItemId(itemName) ?? null };
     });
   }
 
@@ -1559,6 +1559,7 @@
       const hdrs  = { Accept: 'application/json' };
       if (token) hdrs['Authorization'] = token;
       try {
+        _lastMarketReqAt = Date.now();
         const res = await _origFetch(url, { headers: hdrs });
         console.log(TAG, '[market] _fetchMpPriceFull:', itemId, 'status=' + res.status);
         if (!res.ok) {
@@ -1610,6 +1611,7 @@
     // Tracks the capturedAt of the taskboard snapshot for which prices were last
     // refreshed, so we only re-fetch when the snapshot actually changes.
     let _pricesRefreshedForCapturedAt = 0;
+    let _priceRefreshScheduledFor     = 0; // prevents repeated calls from the 200 ms poll
 
     async function _refreshTaskboardPrices(calledFrom) {
       // Mutex: only one refresh running at a time.
@@ -1620,7 +1622,6 @@
       // Min-gap: at least 60 s between runs.
       const sinceLastRun = Date.now() - _refreshPricesLastRan;
       if (_refreshPricesLastRan > 0 && sinceLastRun < _REFRESH_PRICES_MIN_GAP_MS) {
-        console.log(TAG, '[market] _refreshTaskboardPrices skip — too soon (' + Math.round(sinceLastRun / 1000) + 's since last run, min=' + (_REFRESH_PRICES_MIN_GAP_MS / 1000) + 's)');
         return;
       }
       const items = ctx.taskboard;
@@ -1668,8 +1669,9 @@
           } else {
             console.log(TAG, '[market] price fetch returned null for "' + name + '" (' + itemId + ')');
           }
-          // ~1.5 s gap between sequential requests.
-          await new Promise(r => setTimeout(r, 1500));
+          // Shared gate: respect global 2.5 s minimum between marketplace requests.
+          const _mwait = _lastMarketReqAt + _MARKET_REQ_GAP_MS - Date.now();
+          if (_mwait > 0) await new Promise(r => setTimeout(r, _mwait));
         }
 
         _pricesRefreshedForCapturedAt = capturedAt;
@@ -1705,10 +1707,12 @@
 
     // Rate-limit state: shared by taskboard refresh and collector.
     let _marketBackoffUntil      = 0;           // all market fetches halted until this timestamp
+    let _lastMarketReqAt         = 0;           // shared gate: 1 marketplace request per 2.5 s
     let _refreshPricesRunning    = false;        // mutex: only one _refreshTaskboardPrices at a time
     let _refreshPricesLastRan    = 0;            // timestamp of last completed run
     const _REFRESH_PRICES_MIN_GAP_MS = 60_000;  // minimum 60 s between taskboard refreshes
     const _MARKET_BACKOFF_MS         = 5 * 60_000; // 5 min halt on any 429
+    const _MARKET_REQ_GAP_MS         = 2_500;   // global minimum gap between any two marketplace requests
 
     async function _loadPriorityQueue() {
       try {
@@ -1768,6 +1772,7 @@
         console.log(TAG, '[market] collector: skipping tick (429 backoff)');
         return;
       }
+      if (Date.now() - _lastMarketReqAt < _MARKET_REQ_GAP_MS) return;
 
       if (_collectorQueue.length === 0 || _sessionFetchCount >= _MAX_SESSION_FETCHES) {
         clearInterval(_collectorTimer);
@@ -1945,6 +1950,9 @@
       stackedOffersCapturedAt: null,      // ms timestamp when stacked offers were last read live
       marketPrices:           {},         // { itemId: {lowestPrice, quantity} } — extension-fetched
       storageChests:          {},         // { [chestMid]: { items, size, capturedAt } }
+      petAvatar:          null,           // GPlayerCore.petAvatar — active pet id/name, or null
+      hasPet:             null,           // true/false once active-pet status known; null = not yet seen
+      petNames:           [],             // pet name(s) if available
     };
 
     let displayNameCaptured = false;
@@ -1980,16 +1988,20 @@
     let walletDumped         = false; // one-time log of cryptoWallets type/wallet/address
     let unknownFactionLogged = false;
     let vipLogged            = false; // one-time log of GPlayerCore.memberships shape
+    let _petSingleLogged     = false; // one-shot log of selfPlayer.pet active-pet check
+    let _petCoreLogged       = false; // one-shot log of GPlayerCore keys
     let _lastSessionId       = null;  // detect map transitions (room.sessionId change)
     const _loggedRooms       = new Set(); // roomIds already diagnosed (one-time per room)
     let lastEnergy;
 
     // ---- Chest / storage cache -----------------------------------------------
-    const _chestCache       = {};    // { [mid]: { items, size, capturedAt } }
-    let _openingChestMid    = null;  // mid of most recently opened chest
-    const _loggedMsgTypes   = new Set(); // one log per incoming room message type
-    let _lastStorageHash    = '';    // diff guard for storage slot polling
-    let _storageShapeLogged = false; // one-shot raw slot shape diagnostic
+    const _chestCache             = {};      // { [mid]: { items, size, capturedAt, source, ... } }
+    let _openingChestMid          = null;    // mid of most recently opened chest (for backup path)
+    const _loggedMsgTypes         = new Set(); // one log per incoming room message type
+    let _lastStorageHash          = '';      // diff guard for openWindow backup poller
+    let _storageShapeLogged       = false;   // one-shot raw slot shape diagnostic
+    let _lastSelfPlayerChestHash  = '';      // diff guard for selfPlayer.entities scanner
+    const _chestFromSelfPlayer    = new Set(); // mids known from selfPlayer scan
 
     // ---- Room diagnostic helpers (storage/chest discovery) ------------------
 
@@ -2207,6 +2219,29 @@
           ctx.energy = energy; // bare current value; energyMax is sent separately as ctx.energyMax
         }
 
+        // Active pet — selfPlayer.pet is the equipped pet object (tokenId, stage, happiness, avatar…).
+        // hasPet = selfPlayer.pet non-null; never send the raw object (may contain wallet address).
+        if (ctx.hasPet == null) {
+          const activePet = selfPlayer?.pet;
+          if (activePet != null) {
+            if (!_petSingleLogged) {
+              _petSingleLogged = true;
+              console.log(TAG, '[pet] selfPlayer.pet detected — keys:',
+                activePet && typeof activePet === 'object' ? Object.keys(activePet).join(', ') : typeof activePet);
+            }
+            ctx.hasPet = true;
+            const petName = activePet?.name ?? activePet?.type ?? activePet?.petType
+              ?? (typeof activePet === 'string' ? activePet : null);
+            if (petName && !ctx.petNames.includes(petName)) ctx.petNames = [petName];
+          } else {
+            if (!_petSingleLogged) {
+              _petSingleLogged = true;
+              console.log(TAG, '[pet] no selfPlayer.pet — keys:', Object.keys(selfPlayer ?? {}).join(', '));
+            }
+            ctx.hasPet = false;
+          }
+        }
+
         // Wallet address — cryptoWallets is a MapSchema directly on selfPlayer.
         // Prefer the Ronin entry: Pixels marketplace and Stacked both run on Ronin.
         if (!ctx.walletAddress) {
@@ -2254,6 +2289,30 @@
           // Expose room + stateManager for DevTools inspection.
           window.__pxRoom  = _room;
           window.__pxState = getScene()?.stateManager;
+          if (window.PX_COMPANION_DEBUG) window.__pxSelf = getScene()?.stateManager?.selfPlayer;
+
+          // Diagnostic helper — always available, no debug flag needed.
+          // Run window.__pxPets() in DevTools console to inspect pet state.
+          window.__pxPets = function() {
+            const selfPlayer = getScene()?.stateManager?.selfPlayer;
+            const room = getScene()?.stateManager?.room ?? _room;
+            const sessionId = room?.sessionId ?? null;
+            const coreEntry = (sessionId && room?.state?.players)
+              ? (typeof room.state.players.get === 'function'
+                  ? room.state.players.get(sessionId)
+                  : room.state.players[sessionId])
+              : null;
+            const selfKeys = selfPlayer ? Object.keys(selfPlayer) : [];
+            const coreKeys = coreEntry ? Object.keys(coreEntry) : [];
+            const petFields = {};
+            for (const k of selfKeys) {
+              if (k.toLowerCase().includes('pet')) petFields[k] = selfPlayer[k];
+            }
+            for (const k of coreKeys) {
+              if (k.toLowerCase().includes('pet')) petFields['core_' + k] = coreEntry[k];
+            }
+            return { selfKeys, coreKeys, petAvatar: coreEntry?.petAvatar ?? null, petFields };
+          };
 
           // One-time room diagnostic (state keys, MapSchema sizes, storage search).
           if (!_loggedRooms.has(_sessionId)) {
@@ -2274,6 +2333,12 @@
           : null;
 
         if (_coreEntry) {
+          // One-time GPlayerCore key dump for diagnostics (pet fields, owned-pets path)
+          if (!_petCoreLogged) {
+            _petCoreLogged = true;
+            ctx._coreKeyLogged = true;
+            console.log(TAG, '[pet-core] GPlayerCore ALL keys:', Object.keys(_coreEntry).join(', '));
+          }
           // Player ID — use stable MongoDB account ID; UUID stays until mid is available.
           if (_coreEntry.mid) {
             ctx.playerId = _coreEntry.mid;
@@ -2332,6 +2397,27 @@
               'vipTier:', ctx.vipTier, 'energyMax:', em);
             vipLogged = true;
           }
+
+          // Active pet — GPlayerCore.petAvatar holds the equipped pet.
+          const petAvatarRaw = _coreEntry.petAvatar ?? _coreEntry.pet ?? null;
+          if (petAvatarRaw != null) {
+            const petId = petAvatarRaw?.id ?? petAvatarRaw?.petId ?? petAvatarRaw?.nftId
+              ?? (typeof petAvatarRaw === 'string' ? petAvatarRaw : null);
+            if (petId != null) ctx.petAvatar = petId;
+            ctx.hasPet = true;  // petAvatar confirms active pet
+            if (!ctx._petCoreLogged) {
+              ctx._petCoreLogged = true;
+              console.log(TAG, '[pet-core] petAvatar raw:', petAvatarRaw,
+                'keys:', petAvatarRaw && typeof petAvatarRaw === 'object' ? Object.keys(petAvatarRaw) : 'n/a',
+                'resolved id:', petId);
+            }
+          }
+        } else if (!_petCoreLogged && _sessionId) {
+          // coreEntry not found yet — log once so we know room.state.players shape
+          _petCoreLogged = true;
+          const playersType = _room?.state?.players ? typeof _room.state.players : 'no_players';
+          console.log(TAG, '[pet-core] coreEntry not found — sessionId:', _sessionId, 'room.state.players type:', playersType,
+            'state keys:', _room?.state ? Object.keys(_room.state).join(', ') : 'no_state');
         }
 
         // energyMax = base 1000 + VIP stacking bonus. Defaults to 1000 when vipTier is unknown.
@@ -2757,7 +2843,12 @@
             ctx.taskboardCapturedAt = _taskboardCache.capturedAt;
             ctx.taskboardExpiresAt  = _taskboardCache.expiresAt;
             // Fetch prices for the cached snapshot if not yet done for this version.
-            if (!expired && _taskboardCache.capturedAt !== _pricesRefreshedForCapturedAt) {
+            // Use _priceRefreshScheduledFor so this fires at most once per capturedAt,
+            // even though this branch runs every 200 ms while the panel is closed.
+            if (!expired &&
+                _taskboardCache.capturedAt !== _pricesRefreshedForCapturedAt &&
+                _taskboardCache.capturedAt !== _priceRefreshScheduledFor) {
+              _priceRefreshScheduledFor = _taskboardCache.capturedAt;
               _refreshTaskboardPrices('cache-path').catch(() => {});
             }
           } else {
@@ -3028,6 +3119,16 @@
                 return;
               }
 
+              // Hearth Hall season detection — must run before the fast-exit below.
+              if (message) {
+                const _msgStr = typeof message === 'string' ? message
+                  : (typeof message === 'object' ? (message.message ?? message.text ?? message.body ?? '') : '');
+                if (/new bountyfall session has begun/i.test(_msgStr)) {
+                  console.log('[assistant] Hearth Hall season detected');
+                  saveToCompanion('companionEvent', { type: 'hearthHallSeason', data: { detectedAt: Date.now() } });
+                }
+              }
+
               // Fast exit for non-storage types outside capture window.
               if (!_capturing && !/storage|chest|container|slot/i.test(_typeStr)) return;
               // Log each storage-related type exactly once.
@@ -3105,14 +3206,126 @@
     // ---- Statics craft timer scan — 10 s interval ----------------------------
     setInterval(_scanStaticsCraftTimers, 10_000);
 
-    // ---- Storage slot polling — 2 s interval --------------------------------
-    // Polls room.state.storage for changes; caches chest contents by mid when
-    // items appear. This catches the case where no explicit message is sent.
+    // ---- selfPlayer.entities → chest contents (PRIMARY source) — 2 s interval ---
+    // selfPlayer is GPlayerFull; its .entities MapSchema contains every chest
+    // (GPlayerEntity) this player has ever opened, with storage.slots populated.
+    // This replaces "capture on open" and requires NO action on the player's behalf.
     setInterval(() => {
       try {
-        const room = getScene()?.stateManager?.room;
+        const selfPlayer = getScene()?.stateManager?.selfPlayer;
+        if (!selfPlayer) return;
+
+        const entities = selfPlayer.entities;
+        if (!entities) return;
+
+        const room        = getScene()?.stateManager?.room;
+        const mapId       = getScene()?.stateManager?.mapId ?? null;
+        const mapEntities = room?.state?.entities;
+
+        const newEntries = {};
+
+        // Colyseus MapSchema: try .forEach first, then .$items
+        const doForEach = typeof entities.forEach === 'function'
+          ? (cb) => entities.forEach(cb)
+          : (entities.$items ? (cb) => entities.$items.forEach(cb) : null);
+        if (!doForEach) return;
+
+        doForEach((playerEntity, mid) => {
+          if (!playerEntity?.storage) return;
+          if (playerEntity.storage.transient) return; // skip trash bins
+          const slots = playerEntity.storage.slots;
+          if (!slots) return;
+
+          const items = [];
+          const slotForEach = typeof slots.forEach === 'function'
+            ? (cb) => slots.forEach(cb)
+            : (slots.$items ? (cb) => slots.$items.forEach(cb) : null);
+          if (!slotForEach) return;
+
+          slotForEach((slot) => {
+            const itemId = slot?.item?.id ?? slot?.item ?? slot?.itemId ?? null;
+            if (itemId == null) return;
+            const qty = typeof slot?.quantity === 'number' ? slot.quantity : 0;
+            items.push({ itemId: String(itemId), qty });
+          });
+
+          const midStr = String(mid);
+          const mapEnt = mapEntities
+            ? (typeof mapEntities.get === 'function' ? mapEntities.get(midStr) : null)
+            : null;
+
+          const entityType  = playerEntity.entity ?? mapEnt?.entity ?? null;
+          const storageName = playerEntity.storage.name ?? mapEnt?.storage?.name ?? null;
+          const existing    = _chestCache[midStr];
+          // playerEntity.mapId is Colyseus-typed — prefer it as authoritative landId
+          const entityMapId = playerEntity.mapId ? String(playerEntity.mapId) : null;
+
+          newEntries[midStr] = {
+            items,
+            size:        playerEntity.storage.size ?? items.length,
+            capturedAt:  Date.now(),
+            source:      'selfPlayer',
+            entityType:  entityType  ? String(entityType)  : null,
+            storageName: storageName ? String(storageName) : null,
+            landId:      entityMapId ?? (mapEnt ? mapId : null) ?? existing?.landId ?? null,
+          };
+        });
+
+        const _hashable = {};
+        for (const [_m, _e] of Object.entries(newEntries)) {
+          _hashable[_m] = { items: _e.items, size: _e.size, entityType: _e.entityType, storageName: _e.storageName, landId: _e.landId };
+        }
+        const hash = JSON.stringify(_hashable);
+        if (hash === _lastSelfPlayerChestHash) return;
+        _lastSelfPlayerChestHash = hash;
+
+        // Collect the landIds covered by this scan
+        const scannedLandIds = new Set(Object.values(newEntries).map(e => e.landId).filter(Boolean));
+
+        // Remove stale mids: same landId as the current scan but NOT seen in newEntries
+        for (const [midStr, entry] of Object.entries(_chestCache)) {
+          if (scannedLandIds.has(entry.landId) && !newEntries[midStr]) {
+            delete _chestCache[midStr];
+            _chestFromSelfPlayer.delete(midStr);
+            saveToCompanion('chestCacheDelete', { mid: midStr });
+          }
+        }
+
+        // Merge into _chestCache (entries for other maps not yet in selfPlayer are kept)
+        for (const [midStr, entry] of Object.entries(newEntries)) {
+          _chestCache[midStr] = entry;
+          _chestFromSelfPlayer.add(midStr);
+        }
+        ctx.storageChests = { ..._chestCache };
+
+        const chestCount = Object.keys(newEntries).length;
+        const byMapId = {};
+        for (const e of Object.values(newEntries)) {
+          const loc = e.landId ?? '(unknown)';
+          byMapId[loc] = (byMapId[loc] ?? 0) + 1;
+        }
+        const mapSummary = Object.entries(byMapId).map(([m, n]) => `${m}×${n}`).join(', ');
+        console.log(TAG, `[storage] selfPlayer scan: ${chestCount} chest${chestCount !== 1 ? 's' : ''} on ${Object.keys(byMapId).length} location${Object.keys(byMapId).length !== 1 ? 's' : ''} — ${mapSummary} (current map only; other locations load from saved cache)`);
+
+        // Persist each updated chest to chrome.storage.local via content.js
+        for (const [midStr, entry] of Object.entries(newEntries)) {
+          saveToCompanion('chestCache', { mid: midStr, ...entry });
+        }
+      } catch (_) {}
+    }, 2000);
+
+    // ---- room.state.storage — backup while chest window is open — 2 s interval -
+    // Only fires when _openingChestMid is set (player has a chest window open)
+    // AND selfPlayer scan hasn't already provided data for that mid.
+    setInterval(() => {
+      try {
+        if (!_openingChestMid) return;
+        if (_chestFromSelfPlayer.has(_openingChestMid)) return;
+
+        const room    = getScene()?.stateManager?.room;
         const storage = room?.state?.storage;
         if (!storage || typeof storage.forEach !== 'function') return;
+
         const items = [];
         storage.forEach((slot, key) => {
           const itemId = slot?.item?.id ?? slot?.item ?? slot?.itemId ?? null;
@@ -3121,34 +3334,40 @@
                     : typeof slot?.qty      === 'number' ? slot.qty : 0;
           items.push({ key: String(key), itemId: String(itemId), qty });
         });
+
         const hash = JSON.stringify(items);
         if (hash === _lastStorageHash) return;
         _lastStorageHash = hash;
+
         if (items.length === 0) {
-          console.log(TAG, '[room][storage] storage cleared (chest closed?)');
-          return; // don't overwrite cache with empty
+          if (!_storageShapeLogged) {
+            console.log(TAG, '[storage] openWindow: storage cleared or empty');
+          }
+          return;
         }
-        // One-shot: log raw slot shape + toJSON for diagnosis
+
         if (!_storageShapeLogged) {
           _storageShapeLogged = true;
           storage.forEach((slot, key) => {
             try {
-              console.log(TAG, '[room][storage] raw slot shape', {
+              console.log(TAG, '[storage] openWindow raw slot shape', {
                 key, keys: Object.keys(slot ?? {}), json: JSON.stringify(slot).slice(0, 300),
               });
             } catch (_) {}
           });
-          try {
-            const sj = typeof storage.toJSON === 'function' ? storage.toJSON() : null;
-            console.log(TAG, '[room][storage] storage.toJSON():', JSON.stringify(sj).slice(0, 600));
-            console.log(TAG, '[room][storage] storage top-level keys:', Object.keys(storage));
-          } catch (_) {}
         }
-        const mid = _openingChestMid ?? 'unknown';
-        const entry = { items, size: storage.size ?? items.length, removeOnly: !!storage.removeOnly, capturedAt: Date.now() };
-        _chestCache[mid] = entry;
+
+        const mid    = _openingChestMid;
+        const mapId  = getScene()?.stateManager?.mapId ?? null;
+        const existing = _chestCache[mid];
+        const entry  = {
+          items, size: storage.size ?? items.length,
+          capturedAt: Date.now(), source: 'openWindow',
+          landId: existing?.landId ?? mapId,
+        };
+        _chestCache[mid]  = entry;
         ctx.storageChests = { ..._chestCache };
-        console.log(TAG, '[room][storage] chest contents captured (polled)', { mid, itemCount: items.length });
+        console.log(TAG, `[storage] openWindow: ${items.length} items, mid=${mid}, source=openWindow`);
         saveToCompanion('chestCache', { mid, ...entry });
       } catch (_) {}
     }, 2000);

@@ -584,8 +584,30 @@ export function resolveItemName(
       }
     }
 
+    // For single-word queries, prefer items whose FULL display name equals the query;
+    // avoid silently treating a multi-word name (e.g. "Gravelglass Matrix") as an exact match
+    // for a single-word query (e.g. "gravelglass").
+    if (tokens.length === 1) {
+      const allP3 = [...rawMatches, ...craftedMatches];
+      const exactFull = allP3.filter((m) => m.displayName.toLowerCase().trim() === lower);
+      if (exactFull.length === 1) return { kind: "found", itemId: exactFull[0].id };
+      if (exactFull.length > 1) return { kind: "candidates", items: exactFull, rawAmbiguous: false };
+      // Multiple raw items contain the query word — return them as candidates so the
+      // caller can present "Cow Milk, Goat Milk, Pig Milk" instead of falling to fuzzy.
+      if (rawMatches.length > 1) return { kind: "candidates", items: rawMatches, rawAmbiguous: true };
+      // Only multi-word names matched the single-word query — return not_found so
+      // the caller can build a proper "no exact match / also:" answer rather than
+      // silently aliasing the wrong item.
+      if (allP3.length > 0) return { kind: "not_found" };
+    }
+
     if (rawMatches.length === 1) return { kind: "found", itemId: rawMatches[0].id };
     if (rawMatches.length > 1) return { kind: "candidates", items: rawMatches, rawAmbiguous: true };
+    if (craftedMatches.length > 1 && !tokens.some((t) => t === "recipe")) {
+      const nonRecipe = craftedMatches.filter((m) => !m.displayName.toLowerCase().endsWith(" recipe"));
+      if (nonRecipe.length === 1) return { kind: "found", itemId: nonRecipe[0].id };
+      if (nonRecipe.length > 0) return { kind: "candidates", items: nonRecipe, rawAmbiguous: false };
+    }
     if (craftedMatches.length === 1) return { kind: "found", itemId: craftedMatches[0].id };
     if (craftedMatches.length > 1) return { kind: "candidates", items: craftedMatches, rawAmbiguous: false };
   }
@@ -608,8 +630,10 @@ export function resolveItemName(
     }
   }
 
-  // Pass 4: fuzzy DL ≤ 2 against display names in nameMap
-  const fuzzyMatch = fuzzyResolveFromNameMap(raw, nameMap, 2);
+  // Pass 4: fuzzy DL — scale threshold by query length to avoid spurious matches on short strings
+  const rawLen = raw.trim().length;
+  const scaledMaxDist = rawLen < 6 ? 0 : rawLen < 10 ? 1 : 2;
+  const fuzzyMatch = fuzzyResolveFromNameMap(raw, nameMap, scaledMaxDist);
   if (fuzzyMatch) {
     return { kind: "found", itemId: fuzzyMatch.itemId, fuzzyDisplayName: fuzzyMatch.displayName };
   }
@@ -701,9 +725,17 @@ export async function findItemsInQuestion(
   if (bestMatches.size === 0) return [];
 
   // Sort by score; use raw-item status as tiebreaker so raw/gatherable items
-  // rank above crafted products at the same score.
+  // rank above crafted products at the same score. Hutch/blueprint/kit/inactive items
+  // are penalised so base materials always surface first.
+  const queryHasRecipe = /\brecipe\b/i.test(question);
+  const SECONDARY_SUFFIX_RE = /\b(?:hutch|blueprint|kit|inactive|schematic|recipe)\b/i;
   const sorted = [...bestMatches.entries()]
     .sort((a, b) => {
+      const aName = (nameMap[a[0]] ?? "").toLowerCase();
+      const bName = (nameMap[b[0]] ?? "").toLowerCase();
+      const aSec = SECONDARY_SUFFIX_RE.test(aName) ? 1 : 0;
+      const bSec = SECONDARY_SUFFIX_RE.test(bName) ? 1 : 0;
+      if (aSec !== bSec) return aSec - bSec; // penalise secondary items first
       const diff = b[1].score - a[1].score;
       if (Math.abs(diff) > 0.001) return diff;
       const aRaw = isRawItem(a[0], cropFruits, craftableItems, seedItems, allItems, queryIncludesSeed) ? 1 : 0;
@@ -712,8 +744,15 @@ export async function findItemsInQuestion(
     })
     .slice(0, 3);
 
+  // Filter recipe scrolls when the player isn't asking about a recipe scroll.
+  // "how do i make fluppy nigiri" should answer for the dish, not the recipe scroll.
+  const sortedFiltered = queryHasRecipe ? sorted : (() => {
+    const nonRecipe = sorted.filter(([id]) => !(nameMap[id] ?? "").toLowerCase().endsWith(" recipe"));
+    return nonRecipe.length > 0 ? nonRecipe : sorted;
+  })();
+
   const results: ItemMatch[] = [];
-  for (const [itemId, { score }] of sorted) {
+  for (const [itemId, { score }] of sortedFiltered) {
     const itemName: string = nameMap[itemId] ?? itemId;
     const { craftIngredients, requiredSkill, requiredLevel } = await resolveCraftable(
       itemId,
