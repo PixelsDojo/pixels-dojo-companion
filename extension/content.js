@@ -2685,6 +2685,18 @@
       return String(str ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }
 
+    // Per-session set: only log each missing-icon item id once.
+    const _stNoImgLogged = new Set();
+
+    // Humanise UGC item id: "itm_ugc-cyberkongz-sofa-billa--oOaMjbNe" → "Cyberkongz Sofa Billa"
+    function _ugcHumanName(id) {
+      return id
+        .replace(/^itm_ugc-/, '')      // strip prefix
+        .replace(/--[^-]+$/, '')        // strip trailing random suffix (--xxxx)
+        .replace(/-/g, ' ')             // hyphens → spaces
+        .replace(/\b\w/g, c => c.toUpperCase()); // title-case
+    }
+
     function _stIcon(itemId, meta, cls) {
       const info = meta?.[itemId];
       if (info?.imageUrl) {
@@ -2708,24 +2720,29 @@
         img.loading = 'lazy';
         img.style.cssText = 'max-width:40px;max-height:40px;image-rendering:pixelated;display:block;';
         img.onerror = function() {
-          console.log('[px-storage] icon load failed:', id, info.imageUrl);
           this.style.display = 'none';
-          // Replace with initials fallback
           const fb = document.createElement('div');
-          const fbName = info?.name ?? id.replace(/^itm_/, '').replace(/_/g, ' ');
+          const isUgc = id?.startsWith('itm_ugc-');
+          const fbName = info?.name ?? (isUgc ? _ugcHumanName(id) : id.replace(/^itm_/, '').replace(/_/g, ' '));
           const initials = fbName.split(/\s+/).slice(0, 2).map(w => (w[0] ?? '').toUpperCase()).join('');
-          console.log('[px-storage] initials fallback:', id, 'name:', fbName, 'initials:', initials);
+          if (!_stNoImgLogged.has(id)) {
+            _stNoImgLogged.add(id);
+            console.log('[px-storage] icon load failed:', id, '→', fbName);
+          }
           fb.style.cssText = 'width:34px;height:34px;background:#e0d8c8;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:11px;color:#888;font-weight:600;';
           fb.textContent = initials || '?';
           tile.insertBefore(fb, this.nextSibling || null);
         };
         tile.appendChild(img);
       } else {
-        if (id) console.log('[px-storage] no imageUrl for item:', id, 'meta entry:', !!info);
         const ph = document.createElement('div');
-        const phName = info?.name ?? meta?.[id]?.name ?? id.replace(/^itm_/, '').replace(/_/g, ' ');
+        const isUgc = id?.startsWith('itm_ugc-');
+        const phName = info?.name ?? meta?.[id]?.name ?? (isUgc ? _ugcHumanName(id) : id.replace(/^itm_/, '').replace(/_/g, ' '));
         const initials = phName.split(/\s+/).slice(0, 2).map(w => (w[0] ?? '').toUpperCase()).join('');
-        console.log('[px-storage] initials fallback:', id, 'name:', phName, 'initials:', initials);
+        if (id && !_stNoImgLogged.has(id)) {
+          _stNoImgLogged.add(id);
+          console.log('[px-storage] no imageUrl for item:', id, '→', phName);
+        }
         ph.style.cssText = 'width:34px;height:34px;background:#e0d8c8;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:11px;color:#888;font-weight:600;';
         ph.textContent = initials || '?';
         tile.appendChild(ph);

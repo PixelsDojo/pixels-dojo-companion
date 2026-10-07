@@ -1,11 +1,18 @@
 # Pixels Dojo Companion
 
-**v0.3.0** — An AI companion for [Pixels Online](https://pixels.xyz) — instant answers, strategy advice, and live context-aware help, right inside the game.
+**v0.3.1** — An AI companion for [Pixels Online](https://pixels.xyz) — instant answers, strategy advice, and live context-aware help, right inside the game.
 
 > **Work in progress — feedback very welcome!**
 > Share thoughts, bugs, or suggestions: [Feedback form](https://docs.google.com/forms/d/e/1FAIpQLScuYiSpElgN98WqsbMMjqa6IkfyNoN3zE3KyJ96RSxrKi0nHw/viewform)
 
 ---
+
+## What's new in v0.3.1
+
+- **Taskboard works again after the Pixels game update** — the reader now pulls order data directly from the game's own data layer rather than scraping visible text, so future style or layout changes in the game won't break it
+- **Shows when an order is ready to deliver** — orders you already have items for are marked "✓ ready to deliver" in answers and in the companion panel
+- **Stacked App and Crafting panel made update-proof the same way** — their readers switched to wildcard class matching so a Stacked or Crafting redeploy no longer silences them
+- **Quieter console** — poller errors log once instead of every tick; noisy debug entries removed
 
 ## What's new in v0.3.0
 

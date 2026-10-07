@@ -31,6 +31,8 @@
   let _capturedJwt          = null; // first JWT-shaped token (starts with "eyJ") — for Stacked
   const _seenAuthTokens     = new Map(); // token_prefix → url (diagnostic only)
   const _origFetch = window.fetch;
+  // Tracks which poller error keys have already been logged (once-per-key pattern).
+  const _pollErrorLogged = new Set();
 
 
   // Must match BACKEND_URL in content.js.
@@ -71,7 +73,12 @@
               : (h['Authorization'] ?? h['authorization'])) ?? null;
           _recordAuthToken(auth, resource);
         }
-      } catch (_) {}
+      } catch (e) {
+        if (!_pollErrorLogged.has('fetch-wrapper')) {
+          _pollErrorLogged.add('fetch-wrapper');
+          console.error(TAG, '[auth] fetch wrapper error (logged once):', e);
+        }
+      }
 
       return _origFetch.apply(this, arguments);
     };
@@ -222,63 +229,280 @@
   // ---------------------------------------------------------------------------
 
   // Taskboard/Store: extract every item card from the items-content container.
+  //
+  // Per StoreOrderItemCard.tsx (OSS client), each card's React component receives:
+  //   request: { item: { name: string, image: string, tier: number|undefined }, quantity: number }
+  //   reward:  { currency: { amount: number, currencyId?: string },
+  //              skill:    { skillType?: SkillType, xp: number },
+  //              gachaId?: string }
+  //
+  // Strategy A (preferred): walk the card's React fiber .return chain, find the
+  //   props object with request.item.name + request.quantity. Immune to CSS renames.
+  // Strategy B (fallback): query [class*="card-title"] / [class*="item-quantity"] inside
+  //   the card — wildcards, no hash suffix needed.
+  // Strategy C (last resort): leaf-text scan for recognisable patterns.
+  //
+  // Returns an array (possibly empty); sets items._via = "fiber(N)" or "text(N)".
+  // Sets items._firstCardFailReason when card 0 fails all strategies (cards present but parse fails).
+  // Parse "5000", "14K", "1.5K" → number, or 0.
+  function _parseCoinText(s) {
+    const m = String(s).replace(/,/g, '').trim().match(/^([\d.]+)([KkMm]?)$/);
+    if (!m) return 0;
+    let v = parseFloat(m[1]);
+    if (!isFinite(v)) return 0;
+    if (m[2].toLowerCase() === 'k') v *= 1000;
+    if (m[2].toLowerCase() === 'm') v *= 1_000_000;
+    return Math.round(v);
+  }
+
+  // Build costs[] for backward-compat with backend routes that read costs[1] for coin amount.
+  // costs[0] = XP text, costs[1] = coin text. Both filled so backend always finds coins at [1].
+  function _buildCostsArray(coinReward, xpReward) {
+    if (coinReward > 0 || xpReward > 0) {
+      return [xpReward > 0 ? String(xpReward) : '', coinReward > 0 ? String(coinReward) : ''];
+    }
+    return [];
+  }
+
+  // Module-level proxy for _findItemId, which lives inside startPolling().
+  // startPolling() assigns this after _findItemId is defined. Always guard with
+  // typeof === 'function' before calling so a missing helper never crashes extraction.
+  let _taskboardFindItemId = null;
+
+  // Extract itm_xxx from an item image URL: /i/(itm_[^/]+)/
+  function _itemIdFromImageUrl(url) {
+    if (typeof url !== 'string') return null;
+    const m = url.match(/\/i\/(itm_[^/]+)\//);
+    return m ? m[1] : null;
+  }
+
   function extractTaskboardItems(container) {
-    return [...container.querySelectorAll('.Store_store-item-container__yxJbY')].map(card => {
-      const itemName       = card.querySelector('.Store_card-title__InPpB')?.textContent.trim()    ?? '';
-      const tier           = card.querySelector('.Store_card-tier__KvnJ1')?.textContent.trim()     ?? '';
-      const qtyRaw         = card.querySelector('.Store_item-quantity__cFhDE')?.textContent.trim() ?? '';
-      const quantityNeeded = parseInt(qtyRaw.replace(/^[x×]/i, ''), 10) || 0;
-      const costs          = [...card.querySelectorAll('.commons_coinCost__CbysW')].map(el => el.textContent.trim());
-      // isVipLocked: class name contains "vip" anywhere on the card wrapper.
-      const isVipLocked    = [...card.classList].some(c => c.toLowerCase().includes('vip'));
-      // canDeliverNow: find the DELIVER button; absent or disabled → false.
-      const deliverBtn     = [...card.querySelectorAll('button')].find(b => /deliver/i.test(b.textContent));
-      const canDeliverNow  = deliverBtn != null && !deliverBtn.hasAttribute('disabled');
-      // Physical item rewards (e.g. yieldstone box) — best-effort via aria-label on reward icons.
-      const rewardItems    = [...card.querySelectorAll('[class*="reward"] img[aria-label], [class*="Reward"] img[aria-label]')]
-        .map(el => el.getAttribute('aria-label'))
-        .filter(Boolean);
-      return { itemName, tier, quantityNeeded, costs, rewardItems, isVipLocked, canDeliverNow, itemId: _findItemId(itemName) ?? null };
-    });
+    const cardSel = '[class*="store-item-container"], [class*="StoreItem"]';
+    const cards = [...container.querySelectorAll(cardSel)];
+
+    let fiberHits = 0, textHits = 0;
+    let _firstCardFailReason = null; // set when card 0 fails all 3 strategies
+
+    // NO .filter(Boolean) at the end — always return all cards (even empty itemName)
+    // so live.length > 0 is satisfied and the backend knows the taskboard is open.
+    const items = cards.map((card, idx) => {
+      let failA = null, failB = null;
+
+      // ── Strategy A: React fiber walk (up to 20 levels) ───────────────────
+      // Matches StoreOrderItemCard props: { request: { item: { name }, quantity }, reward }
+      const fk = Object.keys(card).find(k => k.startsWith('__reactFiber$'));
+      if (fk) {
+        try {
+          let fiber = card[fk];
+          const seenKeys = [];
+          for (let i = 0; i < 20 && fiber; i++) {
+            const mp = fiber.memoizedProps;
+            if (mp && typeof mp === 'object') {
+              const req = mp.request;
+              if (req && typeof req === 'object' &&
+                  req.item && typeof req.item === 'object' &&
+                  typeof req.item.name === 'string' && req.item.name) {
+                const itemName   = req.item.name;
+                const qty        = req.quantity;
+                const rwd        = mp.reward;
+                const coinReward = typeof rwd?.currency?.amount === 'number' ? Math.round(rwd.currency.amount) : 0;
+                const xpReward   = typeof rwd?.skill?.xp === 'number' ? Math.round(rwd.skill.xp) : 0;
+                const skillType  = rwd?.skill?.skillType ?? null;
+                const deliverBtn = [...card.querySelectorAll('button')].find(b => /deliver/i.test(b.textContent));
+                const canFill    = typeof mp.canFill === 'boolean' ? mp.canFill : false;
+                const orderIndex = typeof mp.orderIndex === 'number' ? mp.orderIndex : idx;
+                // itemId: prefer image URL, then name lookup, then null
+                const imgItemId  = _itemIdFromImageUrl(req.item?.image);
+                const itemId     = imgItemId ?? (typeof _taskboardFindItemId === 'function' ? (_taskboardFindItemId(itemName) ?? null) : null);
+                fiberHits++;
+                return {
+                  itemName,
+                  tier: req.item.tier ?? '',
+                  quantityNeeded: typeof qty === 'number' ? qty : (parseInt(qty, 10) || 0),
+                  costs: _buildCostsArray(coinReward, xpReward),
+                  rewardItems: [],
+                  isVipLocked: [...card.classList].some(c => c.toLowerCase().includes('vip')),
+                  canDeliverNow: deliverBtn != null && !deliverBtn.hasAttribute('disabled'),
+                  canFill, orderIndex, itemId,
+                  coinReward, xpReward, skillType,
+                  _src: 'fiber',
+                };
+              }
+              if (mp) seenKeys.push(`L${i}:[${Object.keys(mp).slice(0, 6).join(',')}]`);
+            }
+            fiber = fiber.return;
+          }
+          if (idx === 0) failA = `fiber: no mp.request.item.name in 20 levels; seen: ${seenKeys.slice(0, 4).join(' ')}`;
+        } catch (e) {
+          if (idx === 0) failA = `fiber: threw ${e?.message ?? e}`;
+        }
+      } else {
+        if (idx === 0) failA = 'fiber: no __reactFiber$ key on card element';
+      }
+
+      // ── Strategy B: CSS wildcard selectors ───────────────────────────────
+      // Store.module.scss class names are stable; only the 5-char hash suffix changes on redeploy.
+      // [class*="card-title"]    → item name   (styles['card-title'])
+      // [class*="item-quantity"] → quantity    (styles['item-quantity'])
+      // [class*="card-tier"]     → tier        (styles['card-tier'])
+      // [class*="coinCost"]      → reward amounts (commons.module.scss)
+      const nameEl     = card.querySelector('[class*="card-title"],[class*="CardTitle"]');
+      const qtyEl      = card.querySelector('[class*="item-quantity"],[class*="ItemQuantity"]');
+      const tierEl     = card.querySelector('[class*="card-tier"],[class*="CardTier"]');
+      const deliverBtn = [...card.querySelectorAll('button')].find(b => /deliver/i.test(b.textContent));
+      // coinCost elements: [0]=XP amount, [1]=coin amount (per StoreOrderItemCard render order)
+      const coinCostEls = [...card.querySelectorAll('[class*="coinCost"],[class*="coin-cost"]')];
+
+      if (nameEl) {
+        const itemName       = nameEl.textContent.trim();
+        const qtyText        = qtyEl?.textContent.trim() ?? '';
+        const quantityNeeded = parseInt(qtyText.replace(/^[x×]/i, ''), 10) || 0;
+        const tier           = tierEl?.textContent.trim() ?? '';
+
+        // Use coinCost elements for costs (stable text, same approach as working c0b4333).
+        const costs = coinCostEls.map(el => el.textContent.trim()).filter(Boolean);
+        // Also derive coinReward numerically from coinCost elements or header scan.
+        let coinReward = 0;
+        if (costs.length >= 2) coinReward = _parseCoinText(costs[1]);
+        else if (costs.length === 1) coinReward = _parseCoinText(costs[0]);
+        if (!coinReward) {
+          // Fallback: scan header leaves for largest numeric value.
+          const headerEl = card.querySelector('[class*="card-header"]');
+          for (const el of [...(headerEl ?? card).querySelectorAll('*')].filter(e => e.childElementCount === 0)) {
+            const v = _parseCoinText(el.textContent.trim());
+            if (v > 100 && v > coinReward) coinReward = v;
+          }
+        }
+
+        if (itemName) {
+          textHits++;
+          return {
+            itemName, tier, quantityNeeded, costs, rewardItems: [],
+            isVipLocked: [...card.classList].some(c => c.toLowerCase().includes('vip')),
+            canDeliverNow: deliverBtn != null && !deliverBtn.hasAttribute('disabled'),
+            canFill: false, orderIndex: idx,
+            itemId: (typeof _taskboardFindItemId === 'function' ? (_taskboardFindItemId(itemName) ?? null) : null),
+            coinReward, xpReward: 0, skillType: null,
+            _src: 'text-class',
+          };
+        }
+        if (idx === 0) failB = `class-sel: [class*="card-title"] found but text was empty`;
+      } else {
+        if (idx === 0) {
+          const allClasses = [...card.querySelectorAll('*')].flatMap(e => [...e.classList]).slice(0, 20).join(' ');
+          failB = `class-sel: no [class*="card-title"] inside card; inner classes: ${allClasses}`;
+        }
+      }
+
+      // ── Strategy C: leaf-text scan (last resort, always returns something) ─
+      const leaves = [...card.querySelectorAll('*')].filter(el => el.childElementCount === 0);
+
+      // Quantity: span inside item-quantity div shows just the number; "x" is a text node.
+      // Also catch "x5" or "×3" when rendered as a single element.
+      let quantityNeeded = 0;
+      if (!quantityNeeded) {
+        const qEl2 = card.querySelector('[class*="item-quantity"],[class*="ItemQuantity"]');
+        if (qEl2) {
+          const raw = qEl2.textContent.trim().replace(/^[x×]/i, '');
+          quantityNeeded = parseInt(raw, 10) || 0;
+        }
+      }
+      if (!quantityNeeded) {
+        for (const el of leaves) {
+          const t = el.textContent.trim();
+          const m = t.match(/^[x×]\s*(\d+)$/i);
+          if (m) { quantityNeeded = parseInt(m[1], 10); break; }
+        }
+      }
+
+      // Item name: longest text that isn't a number, quantity, or button text.
+      const deliverBtn2 = deliverBtn ?? [...card.querySelectorAll('button')].find(b => /deliver/i.test(b.textContent));
+      let itemName = '';
+      for (const el of leaves) {
+        if (deliverBtn2 && deliverBtn2.contains(el)) continue;
+        const t = el.textContent.trim();
+        if (t.length < 3) continue;
+        if (/^[x×]\s*\d+$/i.test(t)) continue;
+        if (/^[\d,]+\.?\d*\s*[KkMm]?$/.test(t)) continue;
+        if (/^\d+\s*(?:xp|exp|pts?)$/i.test(t)) continue;
+        if (/^(?:deliver|vip|tier\s*\d*)$/i.test(t)) continue;
+        if (t.length > itemName.length) itemName = t;
+      }
+
+      // Coin reward: use coinCost elements if present, else scan leaves for largest number.
+      const coinCostEls2 = coinCostEls.length > 0 ? coinCostEls
+        : [...card.querySelectorAll('[class*="coinCost"],[class*="coin-cost"]')];
+      const costs2 = coinCostEls2.map(el => el.textContent.trim()).filter(Boolean);
+      let coinReward2 = 0;
+      if (costs2.length >= 2) coinReward2 = _parseCoinText(costs2[1]);
+      else if (costs2.length === 1) coinReward2 = _parseCoinText(costs2[0]);
+      if (!coinReward2) {
+        for (const el of leaves) {
+          const v = _parseCoinText(el.textContent.trim());
+          if (v > 100 && v > coinReward2) coinReward2 = v;
+        }
+      }
+
+      if (!itemName && idx === 0) {
+        const preview = leaves.slice(0, 8).map(e => `"${e.textContent.trim().slice(0, 40)}"`).join(', ');
+        _firstCardFailReason = `${failA}; ${failB}; leaf-scan: no item name, leaf texts: ${preview}`;
+      }
+
+      textHits++;
+      return {
+        itemName, tier: '', quantityNeeded,
+        costs: costs2.length > 0 ? costs2 : _buildCostsArray(coinReward2, 0),
+        rewardItems: [],
+        isVipLocked: [...card.classList].some(c => c.toLowerCase().includes('vip')),
+        canDeliverNow: deliverBtn2 != null && !deliverBtn2.hasAttribute('disabled'),
+        canFill: false, orderIndex: idx,
+        itemId: itemName ? (typeof _taskboardFindItemId === 'function' ? (_taskboardFindItemId(itemName) ?? null) : null) : null,
+        coinReward: coinReward2, xpReward: 0, skillType: null,
+        _src: 'text-leaf',
+      };
+    }); // intentionally no .filter(Boolean) — empty-name items still count as live
+
+    items._via = fiberHits > 0 ? `fiber(${fiberHits})` : `text(${textHits})`;
+    items._firstCardFailReason = _firstCardFailReason;
+    return items;
   }
 
   // Stacked/Offers: extract every offer accordion from the offers-list container.
   // timerText is returned in the payload but intentionally excluded from the diff
   // key — it's a live countdown that would trigger handleStateUpdate every tick.
   function extractOffers(container) {
-    return [...container.querySelectorAll('.Offers_offerAccordionContainer__GrkuL')].map(offer => {
-      const requirementText = offer.querySelector('.Offers_requirementText__7HIkP')?.textContent.trim()    ?? '';
-      const timerText       = offer.querySelector('.Offers_timerText__VAxWc')?.textContent.trim()          ?? '';
-      const rewards         = [...offer.querySelectorAll('.Offers_rewardIconWrapper__MgOMO')]
+    return [...container.querySelectorAll('[class*="offerAccordionContainer"]')].map(offer => {
+      const requirementText = offer.querySelector('[class*="requirementText"]')?.textContent.trim()    ?? '';
+      const timerText       = offer.querySelector('[class*="timerText"]')?.textContent.trim()          ?? '';
+      const rewards         = [...offer.querySelectorAll('[class*="rewardIconWrapper"]')]
                                 .map(el => el.getAttribute('aria-label'))
                                 .filter(Boolean);
-      const description     = offer.querySelector('.Offers_accordionDescription__l_r2f')?.textContent.trim() ?? '';
+      const description     = offer.querySelector('[class*="accordionDescription"]')?.textContent.trim() ?? '';
       const claimBtn        = [...offer.querySelectorAll('button')].find(b => /claim/i.test(b.textContent));
       const eligible        = claimBtn != null && !claimBtn.hasAttribute('disabled');
       return { requirementText, timerText, rewards, description, eligible };
     });
   }
 
-  // Crafting detail panel: extract one recipe from .Crafting_PageDetails__tYqnD.
+  // Crafting detail panel: extract one recipe from [class*="PageDetails"].
   //
-  // Confirmed selectors:  itemName (.Crafting_detailsTitle__bGjKU), panel root.
-  // Unconfirmed selectors: tier, outputQuantity — use [class*="…"] wildcards;
-  //   update to exact class once seen live.
+  // All selectors use [class*="…"] wildcards — never hardcode the 5-char CSS-module
+  // hash suffix; it changes on every Stacked/Crafting redeploy.
   // Text-pattern fields:  craftTimeSeconds, energyCost, vipRequired, xpSkill,
   //   xpAmount — matched against panel.textContent; text is stable across builds.
   // requiredItems: walk every img in the panel, find nearest ancestor (≤4 levels)
   //   whose text contains an N/N ratio; main item image excluded automatically
   //   because it has no sibling N/N text.
   function extractCraftingRecipe(panel) {
-    const itemName = panel.querySelector('.Crafting_detailsTitle__bGjKU')?.textContent.trim() ?? '';
+    const itemName = panel.querySelector('[class*="detailsTitle"]')?.textContent.trim() ?? '';
     if (!itemName) return null; // panel present but not fully rendered yet
 
-    // tier — small overlay on the item image; class name unconfirmed.
+    // tier — small overlay on the item image.
     const tierEl = panel.querySelector('[class*="tier"i]');
     const tier = tierEl?.textContent.trim() || null;
 
-    // outputQuantity — confirmed selector; text is "x12"-style, strip leading x.
-    const qtyEl = panel.querySelector('.ItemStyles_itemQuantity__5RwoA');
+    // outputQuantity — text is "x12"-style, strip leading x.
+    const qtyEl = panel.querySelector('[class*="itemQuantity"]');
     const qtyRaw = qtyEl?.textContent.trim() ?? '';
     const outputQuantity = parseInt(qtyRaw.replace(/^[x×]/i, ''), 10) || 1;
 
@@ -305,11 +529,10 @@
     const xpSkill  = xpMatch ? xpMatch[1].trim() : null;
     const xpAmount = xpMatch ? parseInt(xpMatch[2].replace(/,/g, ''), 10) : null;
 
-    // requiredItems — confirmed quantity selector: .Crafting_craftingFontQuantities__FDoj9
-    // Each quantity element (e.g. "11/24") is the anchor; we walk up one level
-    // to the ingredient block and find the img inside it.
+    // requiredItems — each quantity element (e.g. "11/24") is the anchor; we walk up
+    // one level to the ingredient block and find the img inside it.
     const requiredItems = [];
-    panel.querySelectorAll('.Crafting_craftingFontQuantities__FDoj9').forEach(qtyEl => {
+    panel.querySelectorAll('[class*="craftingFontQuantities"]').forEach(qtyEl => {
       const m = qtyEl.textContent.trim().match(/(\d+)\s*\/\s*(\d+)/);
       if (!m) return;
       // The img should share a close parent with the quantity element.
@@ -736,6 +959,19 @@
     const _knownPresentUIStates = new Set();  // presentUI params[1] values seen (one-time log)
     const _lastClickEntityInfo  = new Map();  // click mid → {typeId, ts}
     const _loggedCatalogMisses  = new Set();  // item ids logged as catalog misses
+    // Taskboard debug: ring-buffer of the last 20 presentUI events (any ui value).
+    const _recentPresentUIEvents = [];
+    // Track which taskboard container selector succeeded most recently.
+    let _taskboardDetectedVia = null;
+    // Last logged extract count/method — only log when these change.
+    let _taskboardLastLoggedCount = -1;
+    let _taskboardLastLoggedVia   = '';
+    // Auto-snapshot: fires once per session when the panel first has visible cards.
+    let _taskboardAutoSnapshotDone = false;
+    // Last debug snapshot — persists after panel closes so __pxTaskboardDebug() can return it.
+    let _lastTaskboardDebugSnapshot = null;
+    // How many items-content elements existed when last logged — log when count changes.
+    let _itemsContentCountLogged = -1;
 
     // plotSeeds: "mapId:entityMid" → seedItemId — detected from inventory drop at plant time.
     // Persisted via extension storage so labels survive page refreshes.
@@ -1318,6 +1554,8 @@
       }
       return null;
     }
+    // Expose to module-level extractTaskboardItems (which can't reach inside startPolling).
+    _taskboardFindItemId = _findItemId;
 
     function _parseMarketBody(body) {
       if (!body || typeof body !== 'object') return null;
@@ -1901,7 +2139,7 @@
     // Returns remaining ms or null (caller falls back to nextUtcMidnight()).
     function readTaskboardCountdownMs() {
       try {
-        const storeEl = document.querySelector('.Store_items-content__FtMRE');
+        const storeEl = findTaskboardContainer();
         if (!storeEl) return null;
         let root = storeEl.parentElement;
         for (let i = 0; i < 3 && root; i++, root = root.parentElement) {
@@ -2724,7 +2962,7 @@
 
     setInterval(() => {
       try {
-        const container = document.querySelector('.Offers_offersList__4asoP');
+        const container = document.querySelector('[class*="offersList"]');
         if (!container) {
           // Panel closed — serve cached snapshot, filtering out expired offers.
           if (_stackedCache) {
@@ -2817,11 +3055,17 @@
         }
 
         lastOffersSnapshot = new Map([...current].map(([k, v]) => [k, v.key]));
-      } catch (_) {}
+      } catch (e) {
+        if (!_pollErrorLogged.has('stacked-poller')) {
+          _pollErrorLogged.add('stacked-poller');
+          console.error(TAG, '[stacked] poller error (logged once):', e);
+        }
+      }
     }, 200);
 
     // ---- Taskboard / Store panel — extraction + diff + cache -----------------
-    // Polls .Store_items-content__FtMRE every 200 ms.
+    // Polls the items-content container every 200 ms using multi-strategy detection.
+    // Strategy order: exact hashed class → wildcard class → React-fiber scan from presentUI signal.
     // Keyed by "itemName|quantityNeeded" — NOT tier, because tier starts as '' and fills
     // in within the same render cycle, which would produce false appeared/removed events.
     // canDeliverNow flip true → dedicated event type.
@@ -2831,10 +3075,134 @@
     function taskboardItemJson(item) { return JSON.stringify(item); }
     let lastTaskboardSnapshot = null; // Map<"itemName|tier", serialised JSON>
 
+    // Multi-strategy container finder. Returns { el, via } or null.
+    function findTaskboardContainer() {
+      // Strategy 1: wildcard class attribute — matches any hash variant of items-content.
+      // (Store.module.scss: class name "items-content" is stable; only the 5-char hash changes on redeploy.)
+      // There may be multiple matches (Buy / Sell / Orders tabs): prefer whichever has
+      // cards with the "order" class modifier (StoreOrderItemCard wraps in styles.order),
+      // then whichever has any store-item-container cards, then first match.
+      const allContentEls = [...document.querySelectorAll('[class*="items-content"]')];
+      if (allContentEls.length > 0) {
+        if (allContentEls.length !== _itemsContentCountLogged) {
+          _itemsContentCountLogged = allContentEls.length;
+          console.log(`[taskboard] [class*="items-content"] matched ${allContentEls.length} element(s):`,
+            allContentEls.map(e => [...e.classList].join(' ')));
+        }
+        const cardSel = '[class*="store-item-container"], [class*="StoreItem"]';
+        // Prefer the tab that has cards carrying the "order" class (the Orders tab).
+        let best = allContentEls.find(el =>
+          el.querySelector('[class*="store-item-container"][class*="order"],[class*="StoreItem"][class*="order"]')
+        );
+        // Fall back to any tab that has store-item-container cards.
+        if (!best) best = allContentEls.find(el => el.querySelector(cardSel));
+        // Last resort: first match in DOM order.
+        if (!best) best = allContentEls[0];
+        const cardCount = [...best.querySelectorAll(cardSel)].length;
+        return { el: best, via: `wildcard-class([class*="items-content"],${allContentEls.length} matched,${cardCount} cards)` };
+      }
+
+      // Strategy 2: look for a sibling of the title that looks like a taskboard grid.
+      // The taskboard modal typically has a heading containing "taskboard" or "orders".
+      const headings = [...document.querySelectorAll('h1,h2,h3,[class*="title"],[class*="Title"]')]
+        .filter(h => /taskboard|orders|store/i.test(h.textContent));
+      for (const h of headings) {
+        // Walk up to a modal root, then down for a scrollable list container.
+        let root = h.parentElement;
+        for (let i = 0; i < 5 && root; i++, root = root.parentElement) {
+          const candidate = root.querySelector('[class*="content"],[class*="list"],[class*="items"]');
+          if (candidate && candidate !== h) return { el: candidate, via: 'heading-sibling-scan' };
+        }
+      }
+
+      // Strategy 3: presentUI signal — if str_taskBoard_01 was seen recently, try a wider scan.
+      const lastTB = _recentPresentUIEvents.findLast?.(e => e.ui === 'str_taskBoard_01') ??
+        [..._recentPresentUIEvents].reverse().find(e => e.ui === 'str_taskBoard_01');
+      if (lastTB && Date.now() - lastTB.ts < 10_000) {
+        const candidate = document.querySelector('[class*="Store"],[class*="store"],[class*="Board"]');
+        if (candidate) return { el: candidate, via: 'presentUI-str_taskBoard_01-fallback' };
+      }
+
+      return null;
+    }
+
+    // Build a full debug snapshot from a live container+cards. Used by the auto-snapshot
+    // and by __pxTaskboardDebug() when the panel is open.
+    function _buildTaskboardSnapshot(result) {
+      const cardSel   = '[class*="store-item-container"], [class*="StoreItem"]';
+      const cards     = [...result.el.querySelectorAll(cardSel)];
+      const firstCard = cards[0] ?? null;
+
+      let firstCardFibers = [];
+      if (firstCard) {
+        const fk = Object.keys(firstCard).find(k => k.startsWith('__reactFiber$'));
+        if (fk) {
+          let fiber = firstCard[fk];
+          for (let i = 0; i < 8 && fiber; i++) {
+            try {
+              const mp = fiber.memoizedProps;
+              firstCardFibers.push({
+                level: i,
+                propsKeys:   mp ? Object.keys(mp) : null,
+                propsValues: mp ? JSON.stringify(mp).slice(0, 500) : null,
+              });
+            } catch (_) { firstCardFibers.push({ level: i, error: true }); }
+            fiber = fiber.return;
+          }
+        }
+      }
+
+      const allContentEls = [...document.querySelectorAll('[class*="items-content"]')];
+
+      return {
+        ts:                    new Date().toISOString(),
+        containerFound:        true,
+        detectedVia:           result.via,
+        containerClasses:      [...result.el.classList],
+        allItemsContentCount:  allContentEls.length,
+        allItemsContentClasses: allContentEls.map(e => [...e.classList].join(' ')),
+        cardCount:             cards.length,
+        cardClasses:           firstCard ? [...firstCard.classList] : [],
+        recentPresentUIEvents: _recentPresentUIEvents.slice(-10),
+        lastDetectedVia:       _taskboardDetectedVia,
+        cachedOrders:          ctx.taskboard?.length ?? 0,
+        firstCardInnerText:    firstCard?.innerText?.slice(0, 500) ?? null,
+        firstCardOuterHTML:    firstCard?.outerHTML?.slice(0, 1500) ?? null,
+        firstCardFibers,
+      };
+    }
+
+    // Expose debug helper — always available, no debug flag required.
+    // Returns a live snapshot when the panel is open; returns the last stored
+    // auto-snapshot (from when cards were last visible) when the panel is closed.
+    window.__pxTaskboardDebug = function() {
+      const result = findTaskboardContainer();
+      if (result) {
+        const snap = _buildTaskboardSnapshot(result);
+        return snap;
+      }
+      if (_lastTaskboardDebugSnapshot) {
+        return Object.assign({}, _lastTaskboardDebugSnapshot, { _note: 'panel closed — last-open snapshot' });
+      }
+      return {
+        containerFound:        false,
+        detectedVia:           null,
+        recentPresentUIEvents: _recentPresentUIEvents.slice(-10),
+        lastDetectedVia:       _taskboardDetectedVia,
+        cachedOrders:          ctx.taskboard?.length ?? 0,
+        _note:                 'panel not open and no snapshot yet this session',
+      };
+    };
+
     setInterval(() => {
       try {
-        const container = document.querySelector('.Store_items-content__FtMRE');
+        const found = findTaskboardContainer();
+        const container = found?.el ?? null;
         if (!container) {
+          if (_taskboardDetectedVia !== null) {
+            console.log('[taskboard] detection failed: no matching container (was:', _taskboardDetectedVia, ')');
+            _taskboardDetectedVia = null;
+          }
           // Panel closed — serve cached snapshot if present (empty if board expired).
           if (_taskboardCache) {
             const now = Date.now();
@@ -2860,17 +3228,51 @@
           return;
         }
 
+        // Log once when detection strategy changes (new panel open or selector changed).
+        if (found.via !== _taskboardDetectedVia) {
+          console.log('[taskboard] panel open detected via', found.via);
+          _taskboardDetectedVia = found.via;
+        }
+
+        // NOTE: the container element does not need a __reactFiber$ key.
+        // Extraction walks fibers on individual CARD elements, not the container.
+        // Log once if missing (informational only — do NOT return early).
         const fiberKey = Object.keys(container).find(k => k.startsWith('__reactFiber$'));
-        if (!fiberKey) {
-          if (!_fiberMissingLogged.has(container)) {
-            console.log(TAG, 'Store panel: element found but no __reactFiber$ key', container);
-            _fiberMissingLogged.add(container);
+        if (!fiberKey && !_fiberMissingLogged.has(container)) {
+          console.log('[taskboard] note: container has no __reactFiber$ key — using card-level fibers', found.via);
+          _fiberMissingLogged.add(container);
+        }
+
+        // Auto-snapshot: once per session as soon as cards are visible.
+        // Fires regardless of whether extraction succeeds — always captures raw DOM state.
+        const cardSel0 = '[class*="store-item-container"], [class*="StoreItem"]';
+        const cardCount0 = [...container.querySelectorAll(cardSel0)].length;
+        if (!_taskboardAutoSnapshotDone && cardCount0 > 0) {
+          _taskboardAutoSnapshotDone = true;
+          try {
+            const snap = _buildTaskboardSnapshot(found);
+            _lastTaskboardDebugSnapshot = snap;
+            console.log('[taskboard] SNAPSHOT', JSON.stringify(snap));
+          } catch (snapErr) {
+            console.log('[taskboard] SNAPSHOT ERROR', snapErr?.message ?? snapErr, snapErr?.stack ?? '');
           }
-          return;
         }
 
         const capturedAt  = Date.now();
         const items       = extractTaskboardItems(container);
+        const extractVia  = items._via || 'unknown';
+
+        // Log once when extracted count or extraction method changes (not every 200ms poll).
+        if (items.length !== _taskboardLastLoggedCount || extractVia !== _taskboardLastLoggedVia) {
+          console.log(`[taskboard] extracted ${items.length} orders (via ${extractVia})`);
+          _taskboardLastLoggedCount = items.length;
+          _taskboardLastLoggedVia   = extractVia;
+        }
+
+        // When cards are present but extraction returned nothing, log the exact failure reason.
+        if (cardCount0 > 0 && items.length === 0 && items._firstCardFailReason) {
+          console.log(`[taskboard] card 1 parse failed: ${items._firstCardFailReason}`);
+        }
         // Read reset countdown from the panel; fall back to next UTC midnight.
         const countdownMs = readTaskboardCountdownMs();
         const expiresAt   = countdownMs !== null ? capturedAt + countdownMs : nextUtcMidnight();
@@ -2936,7 +3338,9 @@
         }
 
         lastTaskboardSnapshot = new Map([...current].map(([k, v]) => [k, v.json]));
-      } catch (_) {}
+      } catch (e) {
+        console.log('[taskboard] ERROR', e?.message ?? String(e), e?.stack ?? '');
+      }
     }, 200);
 
     // ---- Crafting detail panel — extraction + persist ------------------------
@@ -2948,7 +3352,7 @@
 
     setInterval(() => {
       try {
-        const panel = document.querySelector('.Crafting_PageDetails__tYqnD');
+        const panel = document.querySelector('[class*="Crafting_PageDetails"],[class*="crafting_page-details"],[class*="CraftingPageDetails"]');
         if (!panel) return; // panel not open, silent
 
         const fiberKey = Object.keys(panel).find(k => k.startsWith('__reactFiber$'));
@@ -2971,7 +3375,12 @@
         saveToCompanion('recipe', recipe);
         _lastViewedRecipe = recipe;
         lastCraftingKey = diffKey;
-      } catch (_) {}
+      } catch (e) {
+        if (!_pollErrorLogged.has('crafting-poller')) {
+          _pollErrorLogged.add('crafting-poller');
+          console.error(TAG, '[crafting] poller error (logged once):', e);
+        }
+      }
     }, 200);
 
     // ---- React fiber: Merchant Boat panel ------------------------------------
@@ -2981,7 +3390,7 @@
     setInterval(() => {
       try {
         const props = readFiberPanel(
-          '#__next > div > div.room-layout > div > div.commons_modalBackdrop__EOPaN > div > div.MerchantBoatStore_subheader__1vjBk',
+          '[class*="MerchantBoatStore_subheader"],[class*="merchantboatstore_subheader"],[class*="merchant-boat"] [class*="subheader"]',
           'Merchant Boat panel'
         );
         if (!props || merchantFiberDumped) return;
@@ -3049,6 +3458,18 @@
               const _capturing = Date.now() < _craftCaptureUntil;
               if (_capturing && window.PX_COMPANION_DEBUG) {
                 console.log(`[timers] msg ${_typeStr} ${JSON.stringify(message).slice(0, 300)}`);
+              }
+
+              // presentUI: record all events in ring buffer for __pxTaskboardDebug().
+              if (_typeStr === 'presentUI' && message && typeof message.ui === 'string') {
+                _recentPresentUIEvents.push({ ui: message.ui, ts: Date.now() });
+                if (_recentPresentUIEvents.length > 20) _recentPresentUIEvents.shift();
+                // str_taskBoard_01 = taskboard panel opened signal.
+                if (message.ui === 'str_taskBoard_01') {
+                  console.log('[taskboard] presentUI str_taskBoard_01 received — taskboard panel opened');
+                  // Reset detection cache so the next poll tries all strategies fresh.
+                  _taskboardDetectedVia = null;
+                }
               }
 
               // presentUI: craft station signal

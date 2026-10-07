@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.3.1 — 7 October 2026
+
+### What's new
+
+**Taskboard works again after the Pixels game update**
+The extension now reads taskboard orders directly from the game's internal data layer (React fiber props) rather than scraping rendered text. This means future Pixels style updates, class renames, or layout changes won't break the taskboard reader.
+
+**Shows when an order is ready to deliver**
+Each order now reports whether the game itself says you can deliver it right now. Orders you have items for are shown with "✓ ready to deliver" in both the companion panel and in answers like "do I have items for my taskboard?"
+
+**Stacked App and Crafting panel made update-proof the same way**
+The Stacked offers list and the Crafting detail panel now use wildcard CSS class matching (`[class*="…"]`) instead of exact hashed selectors. A Stacked or Crafting redeploy used to silently break their readers; this closes that gap.
+
+**Quieter console**
+Poller errors (Stacked, Crafting, auth interceptor) now log once per session instead of every 200 ms tick. Several verbose debug entries removed.
+
+---
+
 ## v0.3.0 — 4 October 2026
 
 ### What's new
