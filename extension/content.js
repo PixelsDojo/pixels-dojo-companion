@@ -2685,6 +2685,18 @@
       return String(str ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
     }
 
+    // Per-session set: only log each missing-icon item id once.
+    const _stNoImgLogged = new Set();
+
+    // Humanise UGC item id: "itm_ugc-cyberkongz-sofa-billa--oOaMjbNe" → "Cyberkongz Sofa Billa"
+    function _ugcHumanName(id) {
+      return id
+        .replace(/^itm_ugc-/, '')      // strip prefix
+        .replace(/--[^-]+$/, '')        // strip trailing random suffix (--xxxx)
+        .replace(/-/g, ' ')             // hyphens → spaces
+        .replace(/\b\w/g, c => c.toUpperCase()); // title-case
+    }
+
     function _stIcon(itemId, meta, cls) {
       const info = meta?.[itemId];
       if (info?.imageUrl) {
@@ -2708,24 +2720,29 @@
         img.loading = 'lazy';
         img.style.cssText = 'max-width:40px;max-height:40px;image-rendering:pixelated;display:block;';
         img.onerror = function() {
-          console.log('[px-storage] icon load failed:', id, info.imageUrl);
           this.style.display = 'none';
-          // Replace with initials fallback
           const fb = document.createElement('div');
-          const fbName = info?.name ?? id.replace(/^itm_/, '').replace(/_/g, ' ');
+          const isUgc = id?.startsWith('itm_ugc-');
+          const fbName = info?.name ?? (isUgc ? _ugcHumanName(id) : id.replace(/^itm_/, '').replace(/_/g, ' '));
           const initials = fbName.split(/\s+/).slice(0, 2).map(w => (w[0] ?? '').toUpperCase()).join('');
-          console.log('[px-storage] initials fallback:', id, 'name:', fbName, 'initials:', initials);
+          if (!_stNoImgLogged.has(id)) {
+            _stNoImgLogged.add(id);
+            console.log('[px-storage] icon load failed:', id, '→', fbName);
+          }
           fb.style.cssText = 'width:34px;height:34px;background:#e0d8c8;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:11px;color:#888;font-weight:600;';
           fb.textContent = initials || '?';
           tile.insertBefore(fb, this.nextSibling || null);
         };
         tile.appendChild(img);
       } else {
-        if (id) console.log('[px-storage] no imageUrl for item:', id, 'meta entry:', !!info);
         const ph = document.createElement('div');
-        const phName = info?.name ?? meta?.[id]?.name ?? id.replace(/^itm_/, '').replace(/_/g, ' ');
+        const isUgc = id?.startsWith('itm_ugc-');
+        const phName = info?.name ?? meta?.[id]?.name ?? (isUgc ? _ugcHumanName(id) : id.replace(/^itm_/, '').replace(/_/g, ' '));
         const initials = phName.split(/\s+/).slice(0, 2).map(w => (w[0] ?? '').toUpperCase()).join('');
-        console.log('[px-storage] initials fallback:', id, 'name:', phName, 'initials:', initials);
+        if (id && !_stNoImgLogged.has(id)) {
+          _stNoImgLogged.add(id);
+          console.log('[px-storage] no imageUrl for item:', id, '→', phName);
+        }
         ph.style.cssText = 'width:34px;height:34px;background:#e0d8c8;border-radius:4px;display:flex;align-items:center;justify-content:center;font-size:11px;color:#888;font-weight:600;';
         ph.textContent = initials || '?';
         tile.appendChild(ph);
@@ -3701,10 +3718,21 @@
 
       // Pick best stacked offer — prefer one whose description overlaps taskboard skills; skip sabotage unless player has enough
       const now = Date.now();
+      const buoyBucksBalance = typeof ctx?.buoyBucks === 'number' ? ctx.buoyBucks : null;
       const liveOffers = stacked.filter(o => typeof o.expiresAt !== 'number' || o.expiresAt > now);
       const nonSabotage = liveOffers.filter(o => {
         const text = (o.requirementText ?? o.description ?? '').toLowerCase();
-        if (!text.includes('sabotage')) return true;
+        if (!text.includes('sabotage')) {
+          // Skip Buoy Bucks offer the player can't afford
+          if (buoyBucksBalance !== null) {
+            const bbMatch = text.match(/spend\s+([\d,]+)\s+buoy\s+bucks?/);
+            if (bbMatch) {
+              const bbNeeded = parseInt(bbMatch[1].replace(/,/g, ''), 10);
+              if (buoyBucksBalance < bbNeeded) return false;
+            }
+          }
+          return true;
+        }
         // Only include sabotage offer if player holds >= required sabotage yieldstones
         const saboMatch = text.match(/sabotage\s+(?:enemy\s+unions?|unions?)\s+(\d+)\s+times?/);
         const required = saboMatch ? parseInt(saboMatch[1], 10) : 1;
@@ -3734,19 +3762,35 @@
         lines.push(`📋 ${req}${timeStr ? ` (${timeStr} left)` : ''}`);
       }
 
+      // Build combined inv+storage map so craft-from-stock orders count as 0 cost
+      const chests = ctx?.storageChests ?? {};
+      const heldAll = { ...inv };
+      for (const chest of Object.values(chests)) {
+        if (!Array.isArray(chest?.items)) continue;
+        for (const sl of chest.items) {
+          if (typeof sl.itemId === 'string') heldAll[sl.itemId] = (heldAll[sl.itemId] ?? 0) + (sl.qty ?? 0);
+        }
+      }
+
       // Rank taskboard orders by net coin value; show top 2
       const ranked = taskboard.map(o => {
         const qty = o.quantityNeeded ?? 1;
         const costs = Array.isArray(o.costs) ? o.costs : [];
-        const coinReward = costs.length >= 2 ? parseCoins(costs[1]) : null;
-        const have = (inv[o.itemId] ?? 0);
+        // Prefer numeric coinReward from fiber extraction; fall back to costs[]
+        const coinReward = (typeof o.coinReward === 'number' && o.coinReward > 0)
+          ? o.coinReward
+          : (costs.length >= 2 ? parseCoins(costs[1]) : costs.length === 1 ? parseCoins(costs[0]) : null);
+        const itemId = o.itemId ?? null;
+        const have = itemId ? (heldAll[itemId] ?? 0) : 0;
         const stillNeed = Math.max(0, qty - have);
-        const mp = marketPrices[o.itemId];
-        const fillCost = stillNeed > 0 && mp ? stillNeed * mp.lowestPrice : (stillNeed === 0 ? 0 : null);
-        const netVal = coinReward !== null && fillCost !== null ? coinReward - fillCost : coinReward ?? -Infinity;
-        const affordable2 = fillCost !== null ? fillCost <= maxPrice : true;
+        // If player already has the items (from inv or storage), fill cost is 0
+        const mp = itemId ? marketPrices[itemId] : null;
+        const fillCost = stillNeed === 0 ? 0 : (mp ? stillNeed * mp.lowestPrice : null);
+        // Skip orders where cost is unknown and items aren't in hand (can't rank fairly)
+        const netVal = coinReward !== null && fillCost !== null ? coinReward - fillCost : (fillCost === null && stillNeed > 0 ? -Infinity : coinReward ?? -Infinity);
+        const affordable2 = fillCost !== null ? fillCost <= maxPrice : (stillNeed === 0);
         return { o, qty, have, fillCost, coinReward, netVal, affordable2 };
-      }).filter(r => r.affordable2).sort((a, b) => (b.netVal ?? -Infinity) - (a.netVal ?? -Infinity)).slice(0, 2);
+      }).filter(r => r.affordable2 && r.netVal > -Infinity && (r.fillCost === null ? r.have >= (r.o.quantityNeeded ?? 1) : r.netVal >= 0)).sort((a, b) => (b.netVal ?? -Infinity) - (a.netVal ?? -Infinity)).slice(0, 2);
 
       for (const { o, qty, have, fillCost, coinReward } of ranked) {
         const name = o.itemName ?? 'Unknown';

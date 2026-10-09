@@ -1,24 +1,38 @@
 # Pixels Dojo Companion
 
-**v0.3.0** — An AI companion for [Pixels Online](https://pixels.xyz) — instant answers, strategy advice, and live context-aware help, right inside the game.
+**v0.3.2** — An AI companion for [Pixels Online](https://pixels.xyz) — instant answers, strategy advice, and live context-aware help, right inside the game.
 
 > **Work in progress — feedback very welcome!**
 > Share thoughts, bugs, or suggestions: [Feedback form](https://docs.google.com/forms/d/e/1FAIpQLScuYiSpElgN98WqsbMMjqa6IkfyNoN3zE3KyJ96RSxrKi0nHw/viewform)
 
 ---
 
+## What's new in v0.3.2
+
+- **Works alongside PGA and Voxels** — the extension now coexists cleanly with Pixels Game Addons (PGA) and the Voxels extension. The Phaser hook chains any existing setter rather than overwriting it, and a startup fallback poll ensures the game is detected even if another extension rewires `window.Phaser`. At startup the console logs `[coexist] detected: Voxels` / `detected: PGA` so you can confirm all three extensions are active.
+- **Taskboard resilient to PGA DOM rewrites** — six independent detection strategies (CSS wildcards, heading-sibling scan, order-class parent scan, Deliver-button ancestor scan, React-fiber card scan, presentUI fallback) find the taskboard container even when PGA has restructured the DOM. Each strategy logs its result with a `[taskboard] S1…S6` prefix.
+- **Setter-overwrite warning** — if another extension replaces our `window.Phaser` setter without chaining it, the console logs `[coexist] window.Phaser setter overwritten — relying on startup poll` so the issue is visible rather than silent.
+
+---
+
+## What's new in v0.3.1
+
+- **Taskboard works again after the Pixels game update** — the reader now pulls order data directly from the game's own data layer rather than scraping visible text, so future style or layout changes in the game won't break it
+- **Shows when an order is ready to deliver** — orders you already have items for are marked "✓ ready to deliver" both in the companion panel and in answers
+- **Stacked App and Crafting panel made update-proof the same way** — their readers also switched to wildcard class matching so a Stacked or Crafting redeploy no longer silences them
+- **Quieter console** — poller errors log once instead of every tick; noisy debug entries removed
+
+See [CHANGELOG.md](CHANGELOG.md) for v0.3.0 and earlier.
+
+---
+
 ## What's new in v0.3.0
 
-- **Storage view** — see all your chests by location with game icons, totals, and search — no need to open every chest
-- **Taskboard planner** — have/need from backpack + storage, cost to fill, buy vs craft-from-your-stock (with energy), profit/loss, your coin limit
-- **"Top seven tasks" / "what task first"** — ranks all open orders by net coin value and recommends the best one
-- **Sabotage stone count** — ask how many stones you have for Bountyfall
-- **Pet + storage detected automatically** in setup — no manual config needed
-- **Profile, intro, and Today's XP survive updates** — your settings aren't wiped when the extension updates
-- **Shopping list from recipes** — "add those items" after a crafting answer to fill your shopping list automatically
-- **Friendlier answers** — clearer phrasing throughout; energy shown on every craft option
-
-See [CHANGELOG.md](CHANGELOG.md) for full details.
+- **Storage pop-up** — browse your chest/storage contents from inside the companion panel; inventory answers include storage totals
+- **Pet detection** — the companion knows whether you have a pet and factors it into answers
+- **Buy vs craft decisions** — taskboard orders now show whether buying or crafting the missing items is cheaper, and surface market-volume warnings when stock is thin
+- **Smarter inventory answers** — items grouped by location, friendly names throughout
+- **Onboarding** — the companion introduces itself once and doesn't repeat the pitch every session
 
 ---
 
@@ -49,12 +63,11 @@ The assistant comes in three personas:
 
 - **Ask anything** — "where can I mine tier 3 on water land?", "what should I craft to level Stoneshaping?", "do I have items for my taskboard?"
 - **Live context** — reads your energy, skills, inventory, taskboard orders, and Stacked App offers so answers are specific to *you right now*
-- **Storage view** — all chests across all your land, with totals and search
-- **Taskboard planner** — full have/need breakdown, cost to fill, buy vs craft-from-your-stock with energy, profit/loss per order
 - **Goals tracker** — "add reach Stoneshaping 45 to my goals"; tracks XP progress toward your targets
 - **Ready-land finder** — searches public lands with available industries (mine, farm, cook, etc.) and live-checks spot availability
+- **Taskboard helper** — shows what you can deliver, what's missing, and which order has best net Coin value
 - **Stacked App** — lists your current Pixel-earning offers at a glance
-- **Shopping list** — "add 50 wood to my shopping list", computed from crafting recipes; "add those items" after any crafting answer
+- **Shopping list** — "add 50 wood to my shopping list", computed from crafting recipes
 - **Skill XP guide** — ranks recipes by XP/energy for any skill
 
 ## Privacy
