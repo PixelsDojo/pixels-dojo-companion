@@ -105,5 +105,5 @@ Key environment variables (see `.env.example`):
 
 ## Community
 
-- Website: [pixelsdojo.xyz](https://pixelsdojo.xyz)
+- Website: [pixelsdojo.xyz](https://www.pixelsdojo.xyz)
 - Feedback: [Share your thoughts](https://docs.google.com/forms/d/e/1FAIpQLScuYiSpElgN98WqsbMMjqa6IkfyNoN3zE3KyJ96RSxrKi0nHw/viewform)
